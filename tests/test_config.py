@@ -1,0 +1,47 @@
+import pytest
+
+from ksdraft.config import KSDraftConfig
+
+
+def test_decided_shape_budget():
+    """Locks the Section 9 decided-shape arithmetic to exact integers."""
+    cfg = KSDraftConfig()
+    assert (cfg.layers, cfg.d_model, cfg.head_size) == (24, 1536, 64)
+    assert cfg.n_heads == 24
+    assert cfg.charts == 5888  # round(1536 * 368 / 96)
+    assert cfg.rosa_streams == 512
+
+    assert cfg.mixer_params() == 12_002_304
+    assert cfg.rosa_params() == 3_150_848
+    assert cfg.ks3_params() == 18_135_040
+    assert cfg.layer_params() == 33_288_192  # ~14.0 d^2, matches stock RWKV ratio
+
+    assert cfg.embedding_params() == 150_144 * 1536
+    assert cfg.total_params() == 24 * 33_288_192 + 150_144 * 1536
+    assert 1.02e9 < cfg.total_params() < 1.04e9  # ~1.03B
+
+
+def test_untied_head_doubles_embedding():
+    cfg = KSDraftConfig(tie_word_embeddings=False)
+    assert cfg.embedding_params() == 2 * 150_144 * 1536
+
+
+def test_explicit_charts_override():
+    assert KSDraftConfig(ks3_charts=1000).charts == 1000
+
+
+def test_validation():
+    with pytest.raises(ValueError):
+        KSDraftConfig(dtype="fp8")
+    with pytest.raises(ValueError):
+        KSDraftConfig(d_model=1000, head_size=64)  # not divisible
+    with pytest.raises(ValueError):
+        KSDraftConfig(rosa_bits=0)
+    with pytest.raises(ValueError):
+        KSDraftConfig(rosa_bits=65)
+
+
+def test_summary_shape():
+    s = KSDraftConfig().summary()
+    assert s["total_params"] == KSDraftConfig().total_params()
+    assert s["dtype"] == "int8"

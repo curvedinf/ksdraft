@@ -1,0 +1,50 @@
+# ksdraft target adapter: Recursive Flint (RESEARCH.md Section 9)
+# The first target adapter; core code never branches on target identity.
+
+target:
+  name: flint
+  hf_id: RecursiveSI/flint
+  kind: moe
+  total_params: 39.8e9
+  active_params: 2.5e9
+  layers: 49                 # 2 dense + 47 MoE
+  experts_per_layer: 256     # 6 routed + 1 shared
+  vocab_size: 150144
+  context: 262144            # documented; recipe serves 512k per-request cap
+  sampling: {temperature: 1.0, top_p: 0.95, top_k: 20}
+
+teacher:
+  # In-process PTQR INT8 target via the int8-vllm loader (Section 10).
+  client: int8_vllm
+  dtype: int8
+  fallback_client: hf_bf16   # for targets without int8-vllm support
+  state_taps: [6, 14, 22, 30, 38, 48]   # hidden-state layers fused into the draft
+  topk_logits: 32
+
+draft:                        # RESEARCH.md Section 9, decided shape
+  layers: 24
+  d_model: 1536
+  head_size: 64
+  rosa_streams: 512
+  rosa_bits: 1
+  ks3_charts: 5888
+  block_len: 16
+  anchor_stride: 64
+  dtype: int8                 # int8 | bf16 | fp32
+  tie_word_embeddings: true
+  embedding_init: svd_from_target
+
+training:                     # RESEARCH.md Section 11
+  corpus:
+    n_c4: 3500
+    n_agent: 800
+    n_long: 48
+    n_xlong: 128              # tier-5 512k needle-in-a-haystack documents
+  stages: [warmup, mine, distill, foresight, refine, acceptance, ptqr]
+  optimizer: {kind: adamw, peak_lr: 3.0e-4, schedule: cosine, grad_clip: 1.0}
+  token_budget: 7.5e9         # order 5-10B teacher tokens
+
+gates:                        # PTQR battery + harness calibration
+  top1_mismatch_vs_unquantized: equal
+  acceptance_delta_pt: 1.0    # within +/- 1pt at TP4/C12 greedy bench
+  harness_calibrate_concurrency: [1, 12]

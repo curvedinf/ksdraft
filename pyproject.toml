@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ksdraft"
+version = "0.1.0"
+description = "Parallel block-drafting speculative-decoding draft models: RWKV-8 Rosa mixer + KS3 spine decoders, native INT8 training"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Chase Adams" }]
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+int8 = ["triton"]
+dev = ["pytest"]
+
+[project.scripts]
+ksdraft = "ksdraft.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ksdraft*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
