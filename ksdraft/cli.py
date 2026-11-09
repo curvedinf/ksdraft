@@ -54,11 +54,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--resume", default=None, help="checkpoint path")
     p_train.add_argument("--out", default="runs/train")
 
-    for name, help_text in (
-        ("gate", "run PTQR fidelity + acceptance gates"),
-        ("export", "export serving formats"),
-    ):
-        sub.add_parser(name, help=help_text)
+    p_gate = sub.add_parser("gate", help="run the dtype-tier parity battery")
+    p_gate.add_argument("--config", default="configs/flint.yaml")
+    p_gate.add_argument("--device", default="cpu")
+    p_gate.add_argument("--checkpoint", default=None)
+    p_gate.add_argument("--out", default="runs/gate")
+
+    p_export = sub.add_parser("export", help="export a portable checkpoint")
+    p_export.add_argument("--config", default="configs/flint.yaml")
+    p_export.add_argument("--checkpoint", default=None)
+    p_export.add_argument("--device", default="cpu")
+    p_export.add_argument("--out", default="runs/export")
 
     return parser
 
@@ -182,6 +188,42 @@ def _cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_model(args) -> "object":
+    """Build a model from the config; optionally overlay a checkpoint."""
+    import torch
+
+    from .model import KSDraftModel
+
+    cfg, tspec, _ = _load_target_config(args.config)
+    n_taps = len((tspec.get("state_taps") or [6, 14, 22, 30, 38, 48]))
+    d_tap = int(tspec.get("fixture_d_tap", 64))
+    model = KSDraftModel(cfg, teacher_dim=n_taps * d_tap)
+    if getattr(args, "checkpoint", None):
+        sd = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        model.load_state_dict(sd["model"] if "model" in sd else sd)
+    return model
+
+
+def _cmd_gate(args: argparse.Namespace) -> int:
+    from .gate import run_gate
+
+    model = _load_model(args).to(args.device)
+    report = run_gate(model=model, device=args.device, out_dir=args.out)
+    for name, c in report["checks"].items():
+        print(f"  [{'PASS' if c['pass'] else 'FAIL'}] {name}: {c['detail']}")
+    print(f"gate {'PASSED' if report['all_pass'] else 'FAILED'} -> {args.out}/gate_report.json")
+    return 0 if report["all_pass"] else 1
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    from .export import export_model
+
+    model = _load_model(args).to(args.device)
+    path = export_model(model, args.out)
+    print(f"exported -> {path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "size":
@@ -190,6 +232,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_mine(args)
     if args.command == "train":
         return _cmd_train(args)
+    if args.command == "gate":
+        return _cmd_gate(args)
+    if args.command == "export":
+        return _cmd_export(args)
     print(
         f"'{args.command}' is staged for a later milestone (see RESEARCH.md); "
         "not implemented yet.",

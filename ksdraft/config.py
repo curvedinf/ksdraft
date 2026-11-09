@@ -92,6 +92,7 @@ class KSDraftConfig:
 
     def summary(self) -> dict:
         return {
+            "vocab_size": self.vocab_size,
             "layers": self.layers,
             "d_model": self.d_model,
             "head_size": self.head_size,
@@ -100,6 +101,7 @@ class KSDraftConfig:
             "rosa_bits": self.rosa_bits,
             "ks3_charts": self.charts,
             "dtype": self.dtype,
+            "tie_word_embeddings": self.tie_word_embeddings,
             "rosa_params_per_layer": self.rosa_params(),
             "ks3_params_per_layer": self.ks3_params(),
             "layer_params": self.layer_params(),

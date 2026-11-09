@@ -15,9 +15,12 @@ def test_size_custom(capsys):
     assert "layers            12" in out
 
 
-def test_stub_commands_return_error(capsys):
-    for cmd in ("gate", "export"):
-        assert main([cmd]) == 2
+def test_all_commands_implemented(capsys):
+    # every subcommand now has an implementation; unknown commands error
+    import pytest
+    from ksdraft.cli import _build_parser
+    with pytest.raises(SystemExit):
+        main(["bogus"])
 
 
 def test_train_command_smoke(tmp_path, capsys):
