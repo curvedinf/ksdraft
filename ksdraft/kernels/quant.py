@@ -23,23 +23,27 @@ SCALE_MIN = 2.0**-24
 SCALE_MAX = 65504.0
 
 
-def _padded_length(n: int) -> int:
-    return (n + GROUP_SIZE - 1) // GROUP_SIZE * GROUP_SIZE
+def _padded_length(n: int, group: int = GROUP_SIZE) -> int:
+    return (n + group - 1) // group * group
 
 
-def quantize_last_dim(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """x (..., K) fp -> (codes int8 (..., Kp), scales fp16 (..., Kp/128)).
+def quantize_last_dim(
+    x: torch.Tensor, group: int = GROUP_SIZE
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """x (..., K) fp -> (codes int8 (..., Kp), scales fp16 (..., Kp/group)).
 
-    The padded tail (Kp - K lanes) quantizes to zero codes.
+    The padded tail (Kp - K lanes) quantizes to zero codes. `group` defaults
+    to 128 (ksdraft decision); 32 matches the k-splanifolds reference grid
+    for parity tests.
     """
     if not torch.is_floating_point(x):
         raise TypeError("quantize expects floating-point input")
     K = x.shape[-1]
-    Kp = _padded_length(K)
+    Kp = _padded_length(K, group)
     if Kp != K:
         x = torch.nn.functional.pad(x, (0, Kp - K))
 
-    grouped = x.reshape(*x.shape[:-1], Kp // GROUP_SIZE, GROUP_SIZE)
+    grouped = x.reshape(*x.shape[:-1], Kp // group, group)
     amax = grouped.abs().amax(dim=-1)
     scale = (amax.float() / 127.0).clamp(SCALE_MIN, SCALE_MAX)
     scale = scale.to(SCALE_DTYPE).to(torch.float32)  # round via FP16, then use fp32
@@ -48,11 +52,16 @@ def quantize_last_dim(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         scale.to(SCALE_DTYPE)
 
 
-def dequantize_last_dim(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+def dequantize_last_dim(
+    codes: torch.Tensor, scales: torch.Tensor, group: int | None = None
+) -> torch.Tensor:
     """Inverse of quantize_last_dim (exact on the codes it produced)."""
     K = codes.shape[-1]
-    Kp = _padded_length(K)
+    if group is None:
+        group = scales.shape[-1] and _padded_length(K) // scales.shape[-1] or GROUP_SIZE
+        group = _padded_length(K) // max(scales.shape[-1], 1)
+    Kp = _padded_length(K, group)
     if Kp != K:
         codes = torch.nn.functional.pad(codes, (0, Kp - K))
-    grouped = codes.reshape(*codes.shape[:-1], Kp // GROUP_SIZE, GROUP_SIZE)
+    grouped = codes.reshape(*codes.shape[:-1], Kp // group, group)
     return (grouped.float() * scales.float()[..., None]).reshape(*codes.shape[:-1], Kp)[..., :K]

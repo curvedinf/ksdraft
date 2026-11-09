@@ -53,19 +53,23 @@ def _w8a8_gemm_kernel(
 def w8a8_gemm(
     a_codes: torch.Tensor, a_scales: torch.Tensor,
     w_codes: torch.Tensor, w_scales: torch.Tensor,
+    group: int = GROUP_SIZE,
 ) -> torch.Tensor:
-    """(M,K)x(N,K)^T -> (M,N) fp32. Inputs as produced by quantize_last_dim."""
+    """(M,K)x(N,K)^T -> (M,N) fp32. Inputs as produced by quantize_last_dim
+    with the matching `group` (default 128; 32 = the reference parity grid)."""
     M, K = a_codes.shape
     N = w_codes.shape[0]
     if w_codes.shape[1] != K:
         raise ValueError(f"K mismatch: A {K} vs W {w_codes.shape[1]}")
+    if K % group != 0:
+        raise ValueError(f"K {K} must be a multiple of group {group}")
 
     if not a_codes.is_cuda:
         # Reference path: dequantize both operands, fp32 matmul.
-        a = a_codes.reshape(M, K // GROUP_SIZE, GROUP_SIZE).float() \
-            * a_scales.reshape(M, K // GROUP_SIZE, 1).float()
-        w = w_codes.reshape(N, K // GROUP_SIZE, GROUP_SIZE).float() \
-            * w_scales.reshape(N, K // GROUP_SIZE, 1).float()
+        a = a_codes.reshape(M, K // group, group).float() \
+            * a_scales.reshape(M, K // group, 1).float()
+        w = w_codes.reshape(N, K // group, group).float() \
+            * w_scales.reshape(N, K // group, 1).float()
         return a.reshape(M, K) @ w.reshape(N, K).T
 
     y = torch.empty((M, N), device=a_codes.device, dtype=torch.float32)
@@ -73,5 +77,5 @@ def w8a8_gemm(
     grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
     _w8a8_gemm_kernel[grid](
         a_codes, a_scales, w_codes, w_scales, y,
-        M, N, K, BM, BN, GROUP_SIZE, num_warps=4)
+        M, N, K, BM, BN, group, num_warps=4)
     return y
