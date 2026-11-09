@@ -133,8 +133,21 @@ class RosaMixer(nn.Module):
         return q_in, k_in, v_in
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, d) -> (B, T, d)."""
+        """x: (B, T, d) -> (B, T, d).
+
+        In training mode, when the exact-credit engine is available, the
+        hard core runs through it so the symbol projections receive
+        counterfactual-credit gradients (RESEARCH.md Section 7 pillar).
+        Otherwise the torch reference path runs (payload/out_proj grads
+        only — the documented hard-symbol gradient boundary)."""
         q_in, k_in, v_in = self._shifted(x)
+        if self.training:
+            from ..kernels.rosa_credit import engine_available, rosa_credit_forward
+            if engine_available():
+                hard = rosa_credit_forward(
+                    self.q_proj(q_in), self.k_proj(k_in), self.v_proj(v_in),
+                    self.payload)
+                return self.out_proj(hard.to(x.dtype))
         qbits = (self.q_proj(q_in) > 0).to(torch.int8)   # (B, T, S)
         kbits = (self.k_proj(k_in) > 0).to(torch.int8)
         vbits = (self.v_proj(v_in) > 0).to(torch.int8)

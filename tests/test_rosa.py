@@ -79,12 +79,33 @@ def test_forward_shape_and_hard_gradient_flow():
     y = m(x)
     assert y.shape == (2, 24, 64)
 
+    # eval mode: the torch reference path — payload + output projection
+    # receive gradients, symbol projections do not (hard-symbol boundary)
+    m.eval()
+    y = m(x)
     y.square().mean().backward()
-    # hard symbols: gradients reach payload + output projection
     assert m.payload.grad is not None and m.payload.grad.abs().sum() > 0
     assert m.out_proj.weight.grad is not None and m.out_proj.weight.grad.abs().sum() > 0
-    # ...but not the symbol-producing projections (the counterfactual-credit
-    # backward in the kernels tier is what trains those)
     assert m.q_proj.weight.grad is None
     assert m.k_proj.weight.grad is None
     assert m.v_proj.weight.grad is None
+
+
+def test_training_mode_credit_gradients():
+    """With the credit engine present, training mode trains everything."""
+    from ksdraft.kernels.rosa_credit import engine_available
+    if not engine_available():
+        from ksdraft.kernels import rosa_credit  # noqa: F401
+        import pytest
+        pytest.skip("credit engine not present")
+    torch.manual_seed(0)
+    m = RosaMixer(64, 16).train()
+    with torch.no_grad():
+        m.out_proj.weight.normal_(0, 0.05)
+    x = torch.randn(2, 24, 64)
+    y = m(x)
+    y.square().mean().backward()
+    for name in ("payload", "q_proj.weight", "k_proj.weight", "v_proj.weight",
+                 "out_proj.weight", "time_mix_q"):
+        p = dict(m.named_parameters())[name]
+        assert p.grad is not None and torch.isfinite(p.grad).all(), name
