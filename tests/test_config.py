@@ -12,12 +12,12 @@ def test_decided_shape_budget():
     assert cfg.rosa_streams == 512
 
     assert cfg.mixer_params() == 12_002_304
-    assert cfg.rosa_params() == 3_150_848
+    assert cfg.rosa_params() == 3_153_920  # 4ds + 4d + 4s (biased projections)
     assert cfg.ks3_params() == 18_135_040
-    assert cfg.layer_params() == 33_288_192  # ~14.0 d^2, matches stock RWKV ratio
+    assert cfg.layer_params() == 33_291_264
 
     assert cfg.embedding_params() == 150_144 * 1536
-    assert cfg.total_params() == 24 * 33_288_192 + 150_144 * 1536
+    assert cfg.total_params() == 24 * 33_291_264 + 150_144 * 1536
     assert 1.02e9 < cfg.total_params() < 1.04e9  # ~1.03B
 
 

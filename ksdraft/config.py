@@ -73,8 +73,10 @@ class KSDraftConfig:
         return 5 * d * d + 4 * 32 * d + 6 * d
 
     def rosa_params(self) -> int:
+        # Three biased input projections d->s (+3s), biased output s->d (+d),
+        # three d-dim time-mix vectors (+3d), payload scales (+s).
         d, s = self.d_model, self.rosa_streams
-        return 4 * d * s + 3 * d + s
+        return 4 * d * s + 4 * d + 4 * s
 
     def ks3_params(self) -> int:
         d, c = self.d_model, self.charts

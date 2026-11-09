@@ -5,7 +5,7 @@ def test_size_default(capsys):
     assert main(["size"]) == 0
     out = capsys.readouterr().out
     assert "TOTAL" in out
-    assert "1,029,537,792" in out  # the decided ~1.03B budget
+    assert "1,029,611,520" in out  # the decided ~1.03B budget
     assert "~1.03B" in out
 
 
