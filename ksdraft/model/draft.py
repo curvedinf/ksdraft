@@ -69,7 +69,9 @@ class KSDraftModel(nn.Module):
         if teacher_states is not None:
             if self.teacher_proj is None:
                 raise ValueError("teacher_states passed but teacher_dim=0 at construction")
-            x = x + self.teacher_proj(teacher_states)
+            # the projection owns the dtype boundary (signals arrive fp16)
+            x = x + self.teacher_proj(
+                teacher_states.to(self.teacher_proj.weight.dtype))
 
         prev_feature = None
         features = []

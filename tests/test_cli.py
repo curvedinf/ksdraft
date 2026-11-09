@@ -16,5 +16,24 @@ def test_size_custom(capsys):
 
 
 def test_stub_commands_return_error(capsys):
-    for cmd in ("mine", "train", "gate", "export"):
+    for cmd in ("gate", "export"):
         assert main([cmd]) == 2
+
+
+def test_train_command_smoke(tmp_path, capsys):
+    # tiny run via the CLI on the real config's structure (shape overrides
+    # through a minimal config file to keep it fast)
+    cfg_file = tmp_path / "tiny.yaml"
+    cfg_file.write_text(
+        "target: {vocab_size: 256}\n"
+        "teacher: {state_taps: [1, 2], topk_logits: 8}\n"
+        "draft: {layers: 2, d_model: 96, head_size: 32, rosa_streams: 32,"
+        " ks3_charts: 64}\n"
+    )
+    assert main(["train", "--config", str(cfg_file), "--stage", "warmup",
+                 "--steps", "8", "--seq-len", "32", "--batch-size", "2",
+                 "--corpus-size", "5000",
+                 "--out", str(tmp_path / "run")]) == 0
+    out = capsys.readouterr().out
+    assert "final loss" in out
+    assert list((tmp_path / "run").glob("ckpt_*.pt"))
