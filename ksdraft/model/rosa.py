@@ -142,12 +142,17 @@ class RosaMixer(nn.Module):
         only — the documented hard-symbol gradient boundary)."""
         q_in, k_in, v_in = self._shifted(x)
         if self.training:
+            q_full, k_full, v_full = self.q_proj(q_in), self.k_proj(k_in), self.v_proj(v_in)
+            if x.is_cuda:
+                from ..kernels.rosa_credit_gpu import HardRosaGPU
+                hard = HardRosaGPU.apply(q_full, k_full, v_full, self.payload)
+                return self.out_proj(hard.to(x.dtype))
             from ..kernels.rosa_credit import engine_available, rosa_credit_forward
             if engine_available():
-                hard = rosa_credit_forward(
-                    self.q_proj(q_in), self.k_proj(k_in), self.v_proj(v_in),
-                    self.payload)
+                hard = rosa_credit_forward(q_full, k_full, v_full, self.payload)
                 return self.out_proj(hard.to(x.dtype))
+        else:
+            q_full = k_full = v_full = None
         qbits = (self.q_proj(q_in) > 0).to(torch.int8)   # (B, T, S)
         kbits = (self.k_proj(k_in) > 0).to(torch.int8)
         vbits = (self.v_proj(v_in) > 0).to(torch.int8)
