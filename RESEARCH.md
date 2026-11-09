@@ -820,9 +820,14 @@ implementation map:
 | Gates + export (11 Stage 7, 12) | `ksdraft/gate.py`, `ksdraft/export.py` + CLI | battery passes; safetensors roundtrip incl. tying |
 | MI100 run guide (10) | `MI100.md` | — |
 
-Known boundaries (all documented in MI100.md): the Rosa credit engine is
-CPU/float64 (exact; GPU-native kernel is follow-up work); KS3 `ddown`
-backward cosine 0.82 vs the fp32 reference (float-exception candidate);
-model-wide Int8Linear swap-in for Rosa projections / embedding / head is
-staged for the next workstream; PTQR annealing stages 4-6 are specified
-(Section 11) but not yet implemented as trainer stages.
+Follow-ups completed 2026-11-09: model-wide Int8Linear swap-in
+(`model/int8_convert.py`, gate-checked), GPU-native exact Rosa credits
+(`kernels/rosa_credit_gpu.py` — cosine 1.0000 vs the engine's first-order
+gradients, forward bitwise-exact, T <= 63 windows), and trainer stages 4-7
+(`train/stages.py`: foresight adapter, draft-forced refinement, WTV
+acceptance, PTQR dither annealing + fidelity gates).
+
+Remaining boundaries: the GPU credit path is exact-but-windowed (T <= 63;
+beyond that use the CPU engine or the future suffix-automaton kernel);
+KS3 `ddown` backward cosine 0.82 vs the fp32 reference (float-exception
+candidate); int8 embedding/head (per-row-scale gather) still staged.
