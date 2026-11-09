@@ -8,8 +8,9 @@ Training numerics decided 2026-11-08: full native INT8 forward and backward, wit
 FP16 gradient handoff to the optimizer (Section 8). INT8 checkpoint production via
 PTQR from int8-vllm (Section 8.1).
 Target model decided 2026-11-08: Recursive Flint (40B total / ~2.5B active MoE).
-Draft shape decided 2026-11-08: ~1.03B params — 24 layers, d=1536, head_size 64,
-512 one-bit Rosa streams, ~5.9K rank-1 KS3 charts, tied embeddings (Section 9).
+Draft shape decided 2026-11-08, corrected same day to the RWKV-8-only backbone:
+~0.98B params — 24 layers, d=1792, head_size 64, 597 one-bit Rosa streams,
+6,869 rank-1 KS3 charts, tied embeddings (Section 9).
 
 Researched 2026-11-08. No implementation has begun.
 
@@ -246,7 +247,7 @@ target-state-free route was considered and not selected.
 | --- | --- | --- |
 | Target model (decided) | Recursive Flint — 40B total / ~2.5B active MoE coding agent (Section 9) | [HF](https://huggingface.co/RecursiveSI/flint) |
 | Parallel block proposal | DFlash pattern on RWKV-8 Rosa mixer + KS3 decoders | [DFlash](https://arxiv.org/abs/2602.06036), [Rosa repo](https://github.com/xiaoiecc/qkv-rosa-fast-exact-backward), [KS3](https://github.com/curvedinf/k-splanifolds/blob/main/experiments/common/ks3_int8.py) |
-| Draft shape (decided) | ~1.03B: 24 layers x d=1536, head_size 64, 512 one-bit Rosa streams, ~5.9K KS3 charts, tied embeddings (Section 9) | [v6-Finch-1B6 config](https://huggingface.co/RWKV/v6-Finch-1B6-HF), [RWKV-7 paper](https://openreview.net/pdf/74011cffc1082ac9394afde92802c810c51baabf.pdf) |
+| Draft shape (decided) | ~0.98B: 24 layers x d=1792, 597 one-bit Rosa streams, 6,869 KS3 charts, tied embeddings (Section 9) | [v6-Finch-1B6 config](https://huggingface.co/RWKV/v6-Finch-1B6-HF), [RWKV-7 paper](https://openreview.net/pdf/74011cffc1082ac9394afde92802c810c51baabf.pdf) |
 | Recurrent drafter evidence | H-Spec (hybrid Mamba-attention, no drafter KV) | [arXiv](https://arxiv.org/abs/2609.24197) |
 | Intra-block correction (primary) | DSpine gated adjacent injection, per-layer transfer-space supervision | [arXiv](https://arxiv.org/abs/2609.36173) |
 | Intra-block correction (fallback) | DCOCO parallel contextual scorer, top-k candidates | [arXiv](https://arxiv.org/abs/2610.12570), [code](https://github.com/two-delta/DCOCO) |
@@ -377,9 +378,9 @@ use both: native INT8 training from scratch, PTQR-style exact-serving-kernel stu
 **Decision (2026-11-08):** the target is **Recursive Flint**; the ksdraft draft is
 sized at **~1B parameters** (depth-heavy allocation), with the EAGLE-Harness-style
 cost model as the final arbiter of block length / fan-out / refinement budget.
-Concrete shape decided the same day — see "Draft shape" below: 24 layers, d=1536,
-head_size 64, 512 one-bit Rosa streams, ~5,900 rank-1 KS3 charts, tied embeddings,
-~1.03B total.
+Concrete shape decided the same day and corrected to the RWKV-8-only backbone
+(see "Draft shape" below): 24 layers, d=1792, head_size 64, 597 one-bit Rosa
+streams, 6,869 rank-1 KS3 charts, tied embeddings, 978,138,016 total (~0.98B).
 
 ### Flint — target model facts
 - [RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint): decoder-only MoE
@@ -436,11 +437,18 @@ head_size 64, 512 one-bit Rosa streams, ~5,900 rank-1 KS3 charts, tied embedding
 - **Memory:** 1B INT8 ≈ 1 GB weights + O(1) Rosa state per sequence (no drafter KV);
   negligible next to the target across 4x 32 GB MI100.
 
-### Draft shape (DECIDED 2026-11-08)
+### Draft shape (DECIDED 2026-11-08; corrected same day to the RWKV-8-only backbone)
+
+**Correction (2026-11-08):** the backbone is RWKV-8 proper - the Rosa QKV
+mixer IS the time-mixing layer, with KS3 decoders. The RWKV-7 delta-rule
+component was removed (the RWKV7+ROSA sum was the k-splanifolds experiment's
+hybrid compromise, not this architecture). With the Rosa-only mixer the
+per-layer cost drops, so the width moved 1536 -> 1792 to preserve the
+decided ~1B envelope; depth stays 24.
 
 **Tracking the RWKV World ~1B class.** The World lineage is consistent: every ~1.5B
 model (RWKV-4 1B5, RWKV-5/6 Eagle/Finch 1B6, RWKV-7 G1.5B) is 24 layers x d=2048,
-head_size 64 — verified directly on
+head_size 64 - verified directly on
 [RWKV/v6-Finch-1B6-HF](https://huggingface.co/RWKV/v6-Finch-1B6-HF) config
 (`hidden_size 2048, num_hidden_layers 24, head_size 64`); the
 [RWKV-7 paper](https://openreview.net/pdf/74011cffc1082ac9394afde92802c810c51baabf.pdf)
@@ -451,48 +459,40 @@ lists the World ladder 0.1B/0.4B/1.5B/2.9B with 24 layers through 1.5B and 32 ab
 | RWKV World 0.4B | 0.4B | 24 | 1024 | 64 |
 | RWKV-6 Finch 1B6 (verified) | 1.6B | 24 | 2048 | 64 |
 | RWKV-7 G1.5B | 1.5B | 24 | 2048 | 64 |
-| **ksdraft (decided)** | **~1.03B** | **24** | **1536** | **64** |
+| **ksdraft (decided)** | **~0.96B core** | **24** | **1792** | **64** |
 
-**Decided configuration (d=1536, L=24):**
+**Decided configuration (d=1792, L=24):**
 
 | Component | Setting | Params/layer |
-| --- | --- | --- |
-| RWKV-7-style delta-rule mixer | head_size 64 → 24 heads (d/64); state 64x64/head | ~11.9M (~5.03 d²) |
-| Rosa QKV mixer | 512 independent 1-bit Q/K/V streams (s = d/3, matching the reference's 32 streams at d=96); 3 in-proj + 1 out-proj | ~3.15M (~4ds) |
-| KS3 decoder | ~5,900 rank-1 charts (3.83 d, matching 368@96 and 337@96 precedents) | ~18.1M (~7.66 d²) |
-| Per-layer total | | ~33.2M (~14.0 d² — matches stock RWKV block ratio) |
+| --- | --- | --- | --- |
+| Rosa QKV mixer (the RWKV-8 time-mix) | 597 one-bit streams (d/3, matching the reference's 32 at d=96); 3 biased in-proj + 1 biased out-proj, 3 time-mix vectors, payload scales | 4,288,852 (4ds + 4d + 4s) |
+| KS3 decoder | 6,869 rank-1 charts (d*368/96, matching both k-splanifolds precedents) | 24,673,448 |
+| Per-layer core | | 28,962,300 |
 
-Budget: 24 x 33.2M = 796M layers + 230.6M tied embedding (Flint vocab 150,144 x
-1536) = **~1.03B total**.
+Budget: 24 x 28,962,300 = 695,095,200 layers + 269,058,048 tied embedding
+(Flint vocab 150,144 x 1792) = **964,153,248 core**; + DSpine injection and
+LayerNorm extras 13,984,768 = **978,138,016 total (~0.98B)** - inside the
+decided ~1B envelope and below the 1.2-1.5B harness ceiling.
 
 **Why this shape:**
-- **24 layers is the family constant at this size class** — and depth is what DSpine's
-  injection chain needs (causal conditioning unfolds over network depth). A 12-layer
-  d=2048 alternative also lands ~1B but halves the injection chain; rejected.
-- **d=1536 interpolates the family ladder** (0.4B: 1024, 1.5B: 2048); the width drop
-  vs the 1.5B class is paid for by Flint's 2.3x-larger vocab (tied embedding = 231M).
-- **head_size 64** is the family constant across all sizes (RWKV-6/7); 24 heads.
-- **Rosa streams scale with width** (s = d/3 → 512 one-bit streams), keeping the Rosa
-  component ~1.3 d². Reference precedent: 32 one-bit streams at d=96. Bit-width per
-  stream (Rosa supports 1–64 packed bits) is an ablation knob; one-bit x many streams
-  is the validated configuration.
-- **KS3 charts at 3.83 d** matches the two k-splanifolds precedents (368 and 337
-  charts at width 96) and lands the FFN at ~7.7 d², comparable to the stock MLP FFN.
-- **The k-splanifolds hybrid's 2048D decoder-only side residual is NOT carried over**:
-  at 96D main width it was 21x the main stream (experiment-specific scaffolding for a
-  0.57M-param model); proportional scaling would dominate a 1B budget. Whether a
-  modest side stream helps at this scale is an open ablation.
-- Embedding and LM head tied (budget above assumes tied; untying costs +231M and
-  would require dropping to ~17 layers — not recommended for a draft).
+- **24 layers is the family constant** at this size class, and depth is what
+  DSpine's injection chain needs (causal conditioning unfolds over depth).
+- **d=1792 interpolates the family ladder** (0.4B: 1024, 1.5B: 2048); Flint's
+  2.3x-larger vocab than RWKV's is paid in the tied embedding (269M).
+- **Rosa streams scale with width** (s = d/3 -> 597 one-bit streams);
+  bit-width per stream stays an ablation knob (1-bit x many streams is the
+  validated configuration).
+- **KS3 charts at d*368/96** matches both k-splanifolds precedents.
+- **The k-splanifolds hybrid's 2048D decoder-only side residual is NOT carried
+  over** (experiment scaffolding at 0.57M params; open ablation).
+- Embedding and LM head tied (untying costs +269M - not recommended).
 
-Open ablation knobs (not blocking the decided shape): Rosa stream count vs bits
-(512x1b vs 256x2b vs ...), KS3 chart count (3–3.83 d), side-stream presence, and
-per-layer allocation mix — the DSpine depth argument fixes the 24-layer choice; the
-rest are cheap ablations once the INT8 training system exists.
+Open ablation knobs (not blocking): Rosa streams vs bits, KS3 chart density,
+side-stream presence, per-layer allocation mix.
 
-**Scale caveat (standing):** the Rosa and KS3 components have only been exercised at
-≤96D width; the budget arithmetic is sound but nothing at 1536D has been trained.
-The first real run of the INT8 training system is the actual test of this shape.
+**Scale caveat (standing):** Rosa and KS3 were exercised at <=96D width in the
+references; at 1792D the budget arithmetic is exact but training behavior is
+what the MI100 runs will establish.
 
 ---
 
@@ -776,3 +776,53 @@ the toolkit packages the machinery and makes the parameters config.
 - Section 10's dev workstreams gain a standing constraint: build the repo as an
   installable package with a stable API from the start, not as research scripts that
   get repackaged later.
+
+
+### 8.2 Lessons from the fork's three INT8 draft implementations
+
+The int8-vllm fork ships three INT8 draft paths; what worked and what stayed
+floating (source: the fork's models and commit series on origin/main):
+
+| Draft | INT8 adoption | Measured exceptions / notes |
+| --- | --- | --- |
+| DFlash2 (Qwen3.8-27B, PTQR rung-1) | 35 G128 quant payloads + 12 dequant-grid bf16 surfaces on the deployed wrapper; fidelity gate top-1 == BF16 | selector codebooks and the draft ctx-KV projection stayed bf16 (ladder bf16 > fp16 > int8); GDN state fp32 |
+| LiLiCorr (Nemotron Bolt) | GS128 INT8 residual streams, activation epilogues, draft convolutions, INT8 draft projections + optional INT8 conv taps | GS128 residual transport end-to-end |
+| Flint draft (Flint-DFlash2) | near-universal: int8 selector codebooks via gather-dequant with per-row scales; int8-only dense/shared/draft MLP gate_up with fused SwiGLU+quant; int8 residual stream end to end, no bf16 residual path | PTQR trains the router surface and recovers the cold KLD — PTQR-retraining beats one-shot quant on every surface that initially hurt |
+
+Lessens adopted by ksdraft: (1) small tables (codebooks) quantize fine with
+per-row-scale gather-dequant — the earlier bf16 exception fell in the Flint
+generation; (2) fuse quantization into epilogues (SwiGLU+quant, norm+quant)
+rather than materializing intermediates; (3) when a surface degrades under
+one-shot int8, PTQR-retrain it before declaring it a float exception; (4) the
+float-exception list shrinks with each generation — int8 can be widely
+adopted (user directive), with acceptance gates as the arbiter.
+
+---
+
+## 13. Implementation status (2026-11-08)
+
+The training environment is built and MI100-ready (see MI100.md). Decision ->
+implementation map:
+
+| Decision (section) | Implementation | Validation |
+| --- | --- | --- |
+| Draft shape (9) | `ksdraft/config.py` — exact param formulas locked | `tests/test_config.py` (exact integers) |
+| Rosa mixer + match (5) | `ksdraft/model/rosa.py` — torch reference | brute-force oracle on random bit sequences |
+| Rosa counterfactual backward (5, 7) | `ksdraft/kernels/rosa_credit.py` — exact-credit engine integration | engine forward == torch match at atol=0; symbol-projection gradients verified |
+| KS3 Horner spine (5) | `ksdraft/model/ks3.py` — canonical port | exact parity vs k-splanifolds `ks3.py` |
+| All-INT8 KS3 (8, 12) | `ksdraft/kernels/ks3_int8.py` + fused `ks3_triton.py` | parity vs `ks3_int8.py` on its GS32 grid; STE grads cos 1.0000 on geometry |
+| GS128 W8A8 (8) | `ksdraft/kernels/quant.py`, `gemm.py` | triton-vs-torch parity on gfx1100; partial-group padding |
+| DSpine injection (2, 11) | `ksdraft/model/spine.py` | shape/shift/zero-init tests |
+| Assembly + dtype tiers (12) | `ksdraft/model/draft.py` | identity-block init; bf16 forward; teacher seam; meta-device budget |
+| Corpus incl. tier-5 NIAH (11) | `ksdraft/data/` | strata + format locked vs the fork's generator |
+| Teacher clients (10, 12) | `ksdraft/teacher/` — Fixture + HF backends | determinism + simplex checks; HF behind lazy import |
+| Staged trainer (11) | `ksdraft/train/` — warmup/distill, transfer-space + top-k CE | loss-decrease smokes (CPU + gfx1100 via CLI) |
+| Gates + export (11 Stage 7, 12) | `ksdraft/gate.py`, `ksdraft/export.py` + CLI | battery passes; safetensors roundtrip incl. tying |
+| MI100 run guide (10) | `MI100.md` | — |
+
+Known boundaries (all documented in MI100.md): the Rosa credit engine is
+CPU/float64 (exact; GPU-native kernel is follow-up work); KS3 `ddown`
+backward cosine 0.82 vs the fp32 reference (float-exception candidate);
+model-wide Int8Linear swap-in for Rosa projections / embedding / head is
+staged for the next workstream; PTQR annealing stages 4-6 are specified
+(Section 11) but not yet implemented as trainer stages.

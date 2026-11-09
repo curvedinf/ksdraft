@@ -25,6 +25,11 @@ pip install --no-build-isolation -e .
 pip install --no-build-isolation -e ".[dev]"
 ```
 
+## Running on the MI100 server
+
+See [MI100.md](MI100.md) - environment recipe, memory budget, testing
+ladder, stage commands, and known boundaries.
+
 ## Quick start
 
 ```bash
