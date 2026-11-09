@@ -61,8 +61,17 @@ def w8a8_gemm(
     N = w_codes.shape[0]
     if w_codes.shape[1] != K:
         raise ValueError(f"K mismatch: A {K} vs W {w_codes.shape[1]}")
-    if K % group != 0:
-        raise ValueError(f"K {K} must be a multiple of group {group}")
+    n_groups = a_scales.shape[-1]
+    if w_scales.shape[-1] != n_groups:
+        raise ValueError(
+            f"scale group mismatch: A {n_groups} vs W {w_scales.shape[-1]}")
+    Kp = n_groups * group
+    if Kp < K:
+        raise ValueError(f"K {K} exceeds the scales' padded length {Kp}")
+    if K < Kp:  # partial final group: zero-pad codes (masked loads equivalent)
+        a_codes = torch.nn.functional.pad(a_codes, (0, Kp - K))
+        w_codes = torch.nn.functional.pad(w_codes, (0, Kp - K))
+    K = Kp
 
     if not a_codes.is_cuda:
         # Reference path: dequantize both operands, fp32 matmul.

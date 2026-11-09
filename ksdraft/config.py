@@ -1,16 +1,21 @@
 """Draft model configuration.
 
-Encodes the decided ksdraft shape (RESEARCH.md Section 9, "Draft shape
-DECIDED 2026-11-08") and the dtype tiers (Section 12). Standard-library only
-so the config and its parameter-budget math are usable everywhere.
+Encodes the decided ksdraft shape (RESEARCH.md Section 9, corrected
+2026-11-08 to the RWKV-8-only backbone) and the dtype tiers (Section 12).
+Standard-library only so the config and its parameter-budget math are usable
+everywhere.
 
-Parameter formulas per layer (Section 9 table):
-  - RWKV-7-style delta-rule mixer: 5*d^2 (r,k,v,g,out) + 4*32*d (w/a LoRA
-    pairs) + 6*d (time-mix vectors) ~= 5.03 d^2
-  - Rosa QKV mixer: 4*d*s (three biased input projections d->s and one output
-    projection s->d) + 3*d (time-mix vectors) + s (payload scales)
+The backbone is RWKV-8 proper: the Rosa QKV mixer IS the time-mixing layer
+(no RWKV-7 delta-rule component). Per-layer core parameters:
+
+  - Rosa QKV mixer: 4*d*s (three biased input projections d->s and one
+    biased output projection s->d) + 4*d (three time-mix vectors + output
+    bias) + 4*s (three input biases + payload scales)
   - KS3 decoder: charts * (2*d + 6) + 2*charts (rank-1 subspaces; six spine
     coefficients per output coordinate, warp scale/shift per chart)
+
+DSpine adjacent injection and LayerNorms are tracked as model-level extras
+(~1.5% of the total), not part of the core formulas.
 """
 
 from __future__ import annotations
@@ -21,24 +26,22 @@ VALID_DTYPES = ("int8", "bf16", "fp32")
 
 Dtype = str  # one of VALID_DTYPES; a plain alias keeps configs YAML/JSON friendly
 
-# KS3 chart density: 368 charts at width 96 in the k-splanifolds reference
-# (exactly 5888 charts at d=1536).
+# KS3 chart density: 368 charts at width 96 in the k-splanifolds reference.
 KS3_CHARTS_PER_WIDTH = 368 / 96
 
-# Rosa stream density: 32 one-bit streams at width 96 in the reference
-# (512 streams at d=1536).
+# Rosa stream density: 32 one-bit streams at width 96 in the reference.
 ROSA_STREAMS_PER_WIDTH = 32 / 96
 
 
 @dataclass
 class KSDraftConfig:
-    """Decided default: the ~1.03B draft targeting Flint (Section 9)."""
+    """Decided default: the ~1B RWKV-8 draft targeting Flint (Section 9)."""
 
     vocab_size: int = 150_144
     layers: int = 24
-    d_model: int = 1536
+    d_model: int = 1792
     head_size: int = 64
-    rosa_streams: int = 512
+    rosa_streams: int = 597
     rosa_bits: int = 1
     ks3_charts: int = 0  # 0 -> round(d_model * 368 / 96)
     block_len: int = 16
@@ -49,15 +52,12 @@ class KSDraftConfig:
     def __post_init__(self) -> None:
         if self.dtype not in VALID_DTYPES:
             raise ValueError(f"dtype must be one of {VALID_DTYPES}, got {self.dtype!r}")
-        if self.d_model % self.head_size != 0:
-            raise ValueError(
-                f"d_model {self.d_model} must be divisible by head_size {self.head_size}"
-            )
         if not 1 <= self.rosa_bits <= 64:
             raise ValueError("rosa_bits must be in [1, 64] (Rosa packed symbol width)")
 
     @property
     def n_heads(self) -> int:
+        # head-structured surfaces (e.g., grouped norms) use head_size granularity
         return self.d_model // self.head_size
 
     @property
@@ -66,16 +66,7 @@ class KSDraftConfig:
             return self.ks3_charts
         return round(self.d_model * KS3_CHARTS_PER_WIDTH)
 
-    # ---- per-layer parameter counts (exact integers) ----
-
-    def mixer_params(self) -> int:
-        # Faithful TimeMix port (k-splanifolds rwkv7_ks2 run.py): read/key/
-        # value/output linears 4*d^2 + controllers (decay 64d, rate 64d,
-        # gate 128d, value 64d — value_control on every layer here) + six
-        # time-mix vectors 6d + five bias/scale vectors 5d + bonus d +
-        # GroupNorm affine 2d.
-        d = self.d_model
-        return 4 * d * d + 334 * d
+    # ---- per-layer core parameter counts (exact integers) ----
 
     def rosa_params(self) -> int:
         # Three biased input projections d->s (+3s), biased output s->d (+d),
@@ -88,7 +79,7 @@ class KSDraftConfig:
         return c * (2 * d + 6) + 2 * c
 
     def layer_params(self) -> int:
-        return self.mixer_params() + self.rosa_params() + self.ks3_params()
+        return self.rosa_params() + self.ks3_params()
 
     def embedding_params(self) -> int:
         p = self.vocab_size * self.d_model
@@ -109,7 +100,6 @@ class KSDraftConfig:
             "rosa_bits": self.rosa_bits,
             "ks3_charts": self.charts,
             "dtype": self.dtype,
-            "mixer_params_per_layer": self.mixer_params(),
             "rosa_params_per_layer": self.rosa_params(),
             "ks3_params_per_layer": self.ks3_params(),
             "layer_params": self.layer_params(),

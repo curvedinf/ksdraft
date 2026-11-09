@@ -71,11 +71,10 @@ class KSDraftModel(nn.Module):
                 raise ValueError("teacher_states passed but teacher_dim=0 at construction")
             x = x + self.teacher_proj(teacher_states)
 
-        first_value = None
         prev_feature = None
         features = []
         for block in self.blocks:
-            x, first_value, feature = block(x, first_value, prev_feature)
+            x, feature = block(x, prev_feature)
             prev_feature = feature
             features.append(feature)
         return self.head(self.output_norm(x)), features

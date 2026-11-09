@@ -41,7 +41,7 @@ def test_param_count_matches_config_formula():
     cfg = KSDraftConfig()
     m = KS3(cfg.d_model, cfg.charts)
     n = sum(p.numel() for p in m.parameters())
-    assert n == cfg.ks3_params() == 18_135_040
+    assert n == cfg.ks3_params() == 24_673_448
 
 
 def test_zero_output_projection_doctrine():

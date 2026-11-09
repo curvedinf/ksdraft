@@ -1,11 +1,14 @@
-"""DraftBlock assembly (k-splanifolds RWKV-8-style hybrid shape):
+"""DraftBlock assembly — the RWKV-8 block: Rosa mixer + DSpine injection + KS3.
 
-    h   = x + RWKV7TimeMix(LN_rwkv(x)) + Rosa(LN_rosa(x))   # separate norms, summed
-    h', p = AdjacentInjection(h)                            # DSpine depth conditioning
-    y   = h' + KS3(LN_ffn(h'))
+Per the project decision the backbone is RWKV-8 proper: the Rosa hard-retrieval
+mixer IS the time-mixing layer (no RWKV-7 delta-rule component). The block:
 
-Init doctrine: every additive update starts at zero (rwkv output, rosa out
-proj, ks3 up proj, injection up), so a fresh block is exactly identity.
+    h    = x + Rosa(LN_attn(x))
+    h', p = AdjacentInjection(h)              # DSpine depth conditioning
+    y    = h' + KS3(LN_ffn(h'))
+
+Init doctrine: every additive update starts at zero (rosa out proj, injection
+up, ks3 up), so a fresh block is exactly identity.
 """
 
 from __future__ import annotations
@@ -15,7 +18,6 @@ from torch import nn
 
 from .ks3 import KS3
 from .rosa import RosaMixer
-from .rwkv7 import RWKV7TimeMix
 from .spine import AdjacentInjection
 
 
@@ -23,9 +25,7 @@ class DraftBlock(nn.Module):
     def __init__(self, config, layer: int):
         super().__init__()
         d = config.d_model
-        self.ln_rwkv = nn.LayerNorm(d)
-        self.ln_rosa = nn.LayerNorm(d)
-        self.time_mix = RWKV7TimeMix(d, layer, config.layers, config.head_size)
+        self.ln_attn = nn.LayerNorm(d)
         self.rosa = RosaMixer(d, config.rosa_streams, config.rosa_bits)
         self.injection = AdjacentInjection(d)
         self.ln_ffn = nn.LayerNorm(d)
@@ -34,11 +34,9 @@ class DraftBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        first_value: torch.Tensor | None,
         prev_layer_feature: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        attn, first_value = self.time_mix(self.ln_rwkv(x), first_value)
-        h = x + attn + self.rosa(self.ln_rosa(x))
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        h = x + self.rosa(self.ln_attn(x))
         h, feature = self.injection(h, prev_layer_feature)
         y = h + self.ffn(self.ln_ffn(h))
-        return y, first_value, feature
+        return y, feature

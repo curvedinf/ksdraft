@@ -17,7 +17,7 @@ def test_fresh_block_is_identity():
     cfg = _tiny()
     block = DraftBlock(cfg, layer=0).eval()
     x = torch.randn(2, 16, cfg.d_model)
-    y, fv, feat = block(x, None)
+    y, feat = block(x, None)
     assert torch.allclose(y, x, atol=1e-6)  # every additive update zero-init
 
 
@@ -38,7 +38,6 @@ def test_model_forward_backward():
     with torch.no_grad():
         model.head.weight.normal_(0, 0.02)
         for b in model.blocks:
-            b.time_mix.output.weight.normal_(0, 0.02)
             b.rosa.out_proj.weight.normal_(0, 0.02)
             b.ffn.up.weight.normal_(0, 0.02)
             b.injection.inject.up.weight.normal_(0, 0.02)
@@ -88,13 +87,14 @@ def test_bf16_forward():
 
 
 def test_full_shape_param_budget():
-    """Decided shape on the meta device: core 980,361,216 + injection/LN extras."""
+    """Decided shape on the meta device: core 964,153,248 + injection/LN extras
+    = 978,138,016 total (RWKV-8-only backbone, ~1B envelope)."""
     cfg = KSDraftConfig()
     model = KSDraftModel(cfg, device="meta", skip_init=True)
     counts = model.param_counts()
-    assert counts["core"] == cfg.total_params() == 980_361_216
+    assert counts["core"] == cfg.total_params() == 964_153_248
     d = cfg.d_model
     injection_per_layer = (2 * 64 + 6 * 32) * d + d
-    ln_params = cfg.layers * 3 * 2 * d + 2 * 2 * d  # 3 norms/block + in/out
+    ln_params = cfg.layers * 2 * 2 * d + 2 * 2 * d  # 2 norms/block + in/out
     assert counts["extras"] == cfg.layers * injection_per_layer + ln_params
-    assert counts["total"] == 992_421_888  # ~0.99B, inside the decided ~1B
+    assert counts["total"] == 978_138_016
