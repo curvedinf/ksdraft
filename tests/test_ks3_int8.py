@@ -59,6 +59,30 @@ def test_our_ks3_int8_vs_our_ks3_tolerance():
         assert rel < tol, (mode, rel)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no GPU (fused Triton path)")
+def test_fused_triton_path_matches_composed():
+    """The fused Horner kernel must agree with the torch-composed path."""
+    torch.manual_seed(2)
+    cell = KS3(96, 368).cuda()
+    with torch.no_grad():
+        cell.up.weight.normal_(0, 0.05)
+        cell.coefficients.normal_(0, 0.3)
+    x = torch.randn(64, 96, device="cuda")
+    ref_out = cell(x)  # unquantized reference for scale
+    for mode in ("fp32", "fp16", "int8"):
+        q = KS3Int8Cell(cell, group=128, nonlinear=mode).cuda().eval()
+        with torch.no_grad():
+            y_fused = q(x)                      # CUDA -> fused kernel
+            y_comp = KS3Int8Cell._forward_composed(q, x)
+        # requant-boundary rounding differs between the fp16-scale kernel
+        # epilogue and the composed fp32 path (int8-mode LUT ties from the
+        # fp16 warp intermediate add ~1.7%); both hold vs the reference.
+        torch.testing.assert_close(y_fused.float(), y_comp.float(),
+                                   rtol=5e-2, atol=5e-2)
+        rel = ((y_fused.float() - ref_out).norm() / ref_out.norm()).item()
+        assert rel < 0.08, (mode, rel)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no GPU (reference kernels are Triton)")
 def test_reference_int8_fp32_mode_parity():
     ref_cell, our_cell = _make_pair("cuda")

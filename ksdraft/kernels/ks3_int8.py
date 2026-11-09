@@ -276,6 +276,17 @@ class KS3Int8Cell(nn.Module):
         self.warp_scale_raw = self.master_raw_scale.detach()
         self.warp_shift_raw = self.master_raw_shift.detach()
 
+    def _forward_composed(self, x: torch.Tensor) -> torch.Tensor:
+        """CPU/composed path (also used by the parity test as the oracle)."""
+        x2 = x.reshape(-1, x.shape[-1])
+        xq, xs = quantize_last_dim(x2.float(), self.group)
+        h, _ = self._project(xq, xq, xs, self.down_codes, self.down_scales)
+        hq, hs = quantize_last_dim(h, self.group)
+        y = w8a8_gemm(hq, hs, self.up_codes, self.up_scales, self.group)
+        out_dtype = (torch.get_autocast_gpu_dtype()
+                     if torch.is_autocast_enabled("cuda") else x.dtype)
+        return y.reshape(*x.shape[:-1], self.out_features).to(out_dtype)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.trainable:
             return _KS3Int8Train.apply(
@@ -283,8 +294,20 @@ class KS3Int8Cell(nn.Module):
                 self.master_raw_scale, self.master_raw_shift, self)
         x2 = x.reshape(-1, x.shape[-1])
         xq, xs = quantize_last_dim(x2.float(), self.group)
-        h, _ = self._project(xq, xq, xs, self.down_codes, self.down_scales)
-        hq, hs = quantize_last_dim(h, self.group)
+        if x2.is_cuda:
+            # Fused Horner path: input GEMM + spine + requant in one kernel
+            # (reference `_gemm` FUSED design). The trainable path stays
+            # composed: its backward needs the coordinates.
+            from .ks3_triton import project_fused
+            scale_dq, shift_dq = self._warp_scalars(FP16)
+            hq, hs = project_fused(
+                xq, xs, self.down_codes, self.down_scales,
+                self.spine_codes, self.spine_scale,
+                scale_dq.reshape(-1), shift_dq.reshape(-1),
+                self.tanh_lut, self.group, self.nonlinear)
+        else:
+            h, _ = self._project(xq, xq, xs, self.down_codes, self.down_scales)
+            hq, hs = quantize_last_dim(h, self.group)
         y = w8a8_gemm(hq, hs, self.up_codes, self.up_scales, self.group)
         out_dtype = (torch.get_autocast_gpu_dtype()
                      if torch.is_autocast_enabled("cuda") else x.dtype)
