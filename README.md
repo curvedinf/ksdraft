@@ -1,4 +1,4 @@
-# ksdraft
+# KSDraft
 
 Parallel block-drafting draft models for speculative decoding, targeting the
 Recursive Flint (40B / ~2.5B active MoE) family: an **RWKV-8 Rosa hard-retrieval

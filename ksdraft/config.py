@@ -69,8 +69,13 @@ class KSDraftConfig:
     # ---- per-layer parameter counts (exact integers) ----
 
     def mixer_params(self) -> int:
+        # Faithful TimeMix port (k-splanifolds rwkv7_ks2 run.py): read/key/
+        # value/output linears 4*d^2 + controllers (decay 64d, rate 64d,
+        # gate 128d, value 64d — value_control on every layer here) + six
+        # time-mix vectors 6d + five bias/scale vectors 5d + bonus d +
+        # GroupNorm affine 2d.
         d = self.d_model
-        return 5 * d * d + 4 * 32 * d + 6 * d
+        return 4 * d * d + 334 * d
 
     def rosa_params(self) -> int:
         # Three biased input projections d->s (+3s), biased output s->d (+d),

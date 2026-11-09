@@ -143,5 +143,5 @@ class RosaMixer(nn.Module):
         sign = _match_payload_sign(
             qbits.permute(0, 2, 1), kbits.permute(0, 2, 1), vbits.permute(0, 2, 1)
         )  # (B, S, T)
-        out = self.payload[None, :, None] * sign         # (B, S, T)
-        return self.out_proj(out.permute(0, 2, 1))
+        out = self.payload[None, :, None] * sign         # (B, S, T) fp32
+        return self.out_proj(out.permute(0, 2, 1).to(x.dtype))

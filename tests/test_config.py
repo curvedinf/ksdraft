@@ -11,14 +11,14 @@ def test_decided_shape_budget():
     assert cfg.charts == 5888  # round(1536 * 368 / 96)
     assert cfg.rosa_streams == 512
 
-    assert cfg.mixer_params() == 12_002_304
+    assert cfg.mixer_params() == 9_950_208  # faithful TimeMix port: 4d^2 + 334d
     assert cfg.rosa_params() == 3_153_920  # 4ds + 4d + 4s (biased projections)
     assert cfg.ks3_params() == 18_135_040
-    assert cfg.layer_params() == 33_291_264
+    assert cfg.layer_params() == 31_239_168
 
     assert cfg.embedding_params() == 150_144 * 1536
-    assert cfg.total_params() == 24 * 33_291_264 + 150_144 * 1536
-    assert 1.02e9 < cfg.total_params() < 1.04e9  # ~1.03B
+    assert cfg.total_params() == 24 * 31_239_168 + 150_144 * 1536
+    assert 0.97e9 < cfg.total_params() < 1.0e9  # ~0.98B core (within decided ~1B)
 
 
 def test_untied_head_doubles_embedding():
