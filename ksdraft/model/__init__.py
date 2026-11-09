@@ -10,8 +10,10 @@ from .rosa import RosaMixer
 from .spine import AdjacentInjection
 from .block import DraftBlock
 from .draft import KSDraftModel
+from .int8_convert import to_int8, int8_surfaces
 
 __all__ = [
     "KS3", "spine_horner", "spine_basis", "RosaMixer",
     "AdjacentInjection", "DraftBlock", "KSDraftModel",
+    "to_int8", "int8_surfaces",
 ]

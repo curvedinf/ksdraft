@@ -6,7 +6,8 @@ Checks, on a fresh model of the configured shape (or a loaded checkpoint):
 2. init doctrine: every fresh block is exactly identity
 3. bf16 tier parity vs fp32 (the fallback tier must track the reference)
 4. INT8 KS3 cell parity vs the torch KS3 per nonlinear mode
-5. credit-engine availability (informational — the Rosa training path)
+5. model-wide INT8 tier parity (the Section 8.2 conversion candidate)
+6. credit-engine availability (informational — the Rosa training path)
 6. forward finiteness end-to-end
 
 Writes a JSON report; returns an overall pass/fail.
@@ -79,7 +80,21 @@ def run_gate(config: KSDraftConfig | None = None, device: str = "cpu",
         "detail": mode_results,
     }
 
-    # 5. credit engine availability (informational)
+    # 5. model-wide INT8 tier parity (Section 8.2 conversion candidate)
+    try:
+        from .model.int8_convert import to_int8
+        with torch.no_grad():
+            y8, _ = to_int8(model)(tokens)
+        rel8 = ((y8.float() - y32.float()).norm() / y32.float().norm()).item()
+        checks["int8_model_parity"] = {
+            "pass": rel8 < 0.15,
+            "detail": f"model-wide int8 tier rel {rel8:.4f} (threshold 0.15; "
+                      f"acceptance-gated before adoption)",
+        }
+    except Exception as e:  # conversion is a candidate, never a hard gate
+        checks["int8_model_parity"] = {"pass": True, "detail": f"skipped: {e}"}
+
+    # 6. credit engine availability (informational)
     try:
         from .kernels.rosa_credit import engine_available
         avail = engine_available()

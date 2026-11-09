@@ -50,6 +50,10 @@ class Int8Linear(nn.Module):
         self.weight_scales = scales
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled() and self.weight.requires_grad:
+            # training: STE path keeps autograd (quantized forward is not
+            # differentiable); inference/eval uses the W8A8 kernels
+            return self.fake_quant_forward(x)
         self._quantize_weight()  # cheap; keeps live fp32 masters authoritative
         x2 = x.reshape(-1, x.shape[-1])
         a_codes, a_scales = quantize_last_dim(x2.float())
