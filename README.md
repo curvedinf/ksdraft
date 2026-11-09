@@ -1,11 +1,16 @@
 # KSDraft
 
-Parallel block-drafting draft models for speculative decoding, targeting the
-Recursive Flint (40B / ~2.5B active MoE) family: an **RWKV-8 Rosa hard-retrieval
-mixer** with **KS3 spine decoders**, **DSpine depth-carried causal injection**,
-**JetSpec++ foresight pipelining**, and an **EAGLE-Harness-style cost scheduler** —
-trained as a **fully native INT8 system** (INT8 forward and backward, FP16 gradient
-handoff), with PTQR-style rounding-dither annealing and fidelity gates.
+Parallel block-drafting draft models for speculative decoding.
+
+Architecture:
+
+- **DSpine depth-carried causal injection**
+- **JetSpec++ foresight pipelining**
+- **EAGLE-Harness-style cost scheduler**
+- **RWKV-8 Rosa attention**
+- **KS3 decoders**
+- **Fully native INT8 forward and backward**
+- **PTQR rounding-dither annealing**
 
 Status: implementation in progress. The full architecture research, decisions, and
 training-regime design live in [RESEARCH.md](RESEARCH.md) — it is the source of
@@ -13,7 +18,7 @@ truth for every design choice in this repo.
 
 ## Install
 
-Into a ROCm/CUDA torch environment (e.g. the `rocm7` pyenv env):
+Into a ROCm/CUDA torch environment:
 
 ```bash
 pip install --no-build-isolation -e .
@@ -43,7 +48,7 @@ configs/        # target adapters (flint.yaml first)
 tests/
 ```
 
-## Dtype tiers (RESEARCH.md Section 12)
+## Dtype tiers
 
 - `int8` — intended target: W8A8 GS128, maximal fusion (training AND serving)
 - `bf16` — generic fallback: same graph, portable kernels, parity reference
