@@ -43,7 +43,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_train = sub.add_parser("train", help="run a training stage")
     p_train.add_argument("--config", default="configs/flint.yaml")
-    p_train.add_argument("--stage", choices=["warmup", "distill"], default="warmup")
+    p_train.add_argument("--stage", choices=["warmup", "distill", "foresight",
+                                             "refine", "acceptance", "ptqr"],
+                         default="warmup")
     p_train.add_argument("--device", default="cpu")
     p_train.add_argument("--steps", type=int, default=None)
     p_train.add_argument("--seq-len", type=int, default=None)

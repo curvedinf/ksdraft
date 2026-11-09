@@ -45,9 +45,19 @@ class Int8Linear(nn.Module):
 
     @torch.no_grad()
     def _quantize_weight(self) -> None:
-        codes, scales = quantize_last_dim(self.weight.detach().float())
+        dither = float(getattr(self, "_dither", 0.0))
+        if dither > 0:
+            from ..train.stages import quantize_last_dim_dithered
+            codes, scales = quantize_last_dim_dithered(
+                self.weight.detach().float(), 128, dither)
+        else:
+            codes, scales = quantize_last_dim(self.weight.detach().float())
         self.weight_codes = codes
         self.weight_scales = scales
+
+    def _quantize_weight_dithered(self, dither: float) -> None:
+        self._dither = dither
+        self._quantize_weight()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if torch.is_grad_enabled() and self.weight.requires_grad:
@@ -63,10 +73,18 @@ class Int8Linear(nn.Module):
         return y.reshape(*x.shape[:-1], self.out_features).to(x.dtype)
 
     def fake_quant_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """STE path: fp32 GEMM on quantize-dequantized operands (autograd-safe)."""
+        """STE path: fp32 GEMM on quantize-dequantized operands (autograd-safe).
+        Honors ``self._dither`` (PTQR annealing) if set."""
         from .quant import dequantize_last_dim
+        from . import quant as _q
 
-        self._quantize_weight()  # live fp32 masters stay authoritative
+        dither = float(getattr(self, "_dither", 0.0))
+        if dither > 0:
+            from . import gemm as _g  # noqa: F401
+            from ..train.stages import quantize_last_dim_dithered
+            self._quantize_weight_dithered(dither)
+        else:
+            self._quantize_weight()  # live fp32 masters stay authoritative
         w = dequantize_last_dim(self.weight_codes.detach().float(),
                                 self.weight_scales.detach()) \
             + (self.weight - self.weight.detach())
