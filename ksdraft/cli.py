@@ -57,6 +57,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--out", default="runs/train")
     p_train.add_argument("--block-n", type=int, default=0,
                          help="parallel block-draft offsets to supervise")
+    p_train.add_argument("--block-weight", type=float, default=None)
+    p_train.add_argument("--lr", type=float, default=None,
+                         help="override the recipe peak learning rate")
+    p_train.add_argument("--warmup-steps", type=int, default=None)
     p_train.add_argument("--save-every", type=int, default=None,
                          help="checkpoint interval in steps (default: steps/10)")
 
@@ -188,9 +192,14 @@ def _cmd_train(args: argparse.Namespace) -> int:
         steps=args.steps or int(trspec.get("steps", 50)),
         seq_len=args.seq_len or 64,
         batch_size=args.batch_size or 4,
-        peak_lr=float((trspec.get("optimizer") or {}).get("peak_lr", 3e-4)),
+        peak_lr=(args.lr if args.lr is not None
+                 else float((trspec.get("optimizer") or {}).get("peak_lr", 3e-4))),
+        warmup=(args.warmup_steps if args.warmup_steps is not None
+                else TrainConfig.warmup),
         val_every=args.save_every or max(1, (args.steps or 50) // 10),
         block_n=args.block_n,
+        block_weight=(args.block_weight if args.block_weight is not None
+                      else TrainConfig.block_weight),
     )
     trainer = Trainer(model, teacher, sampler, tcfg, device=args.device,
                       out_dir=args.out)
