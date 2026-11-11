@@ -30,6 +30,10 @@ from .draft import KSDraftModel
 
 def to_int8(model: KSDraftModel, group: int = 128,
             nonlinear: str = "int8") -> KSDraftModel:
+    # Idempotent: export and serving paths may hand over an already-converted
+    # model (loaded from a tier="int8" checkpoint).
+    if getattr(model, "_int8_tier", None):
+        return model
     converted = copy.deepcopy(model)
     n_swapped = 0
     for block in converted.blocks:

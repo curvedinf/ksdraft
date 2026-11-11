@@ -51,6 +51,9 @@ class TrainConfig:
     # the new head cannot disturb the (already trained) next-token backbone;
     # the backbone unfreezes afterwards.
     block_only_steps: int = 0
+    # Phase A compute/checkpoint dtype: fp16 (decided), bf16, or fp32. The
+    # late PTQR stage converts to the int8 tier for annealing.
+    train_dtype: str = "fp16"
     val_every: int = 50
     seed: int = 11
 
@@ -150,6 +153,13 @@ class Trainer:
         cos = 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
         return c.min_lr_frac + (1 - c.min_lr_frac) * cos
 
+    def _amp(self):
+        dt = str(self.cfg.train_dtype).lower()
+        if dt == "fp32" or self.device == "cpu":
+            return torch.autocast(device_type="cpu", enabled=False)
+        dtype = torch.float16 if dt == "fp16" else torch.bfloat16
+        return torch.autocast(device_type="cuda", dtype=dtype)
+
     def _apply_lr(self, step: int):
         lr = self.cfg.peak_lr * self._lr_scale(step)
         for g in self.opt.param_groups:
@@ -195,8 +205,9 @@ class Trainer:
                 # first seq_len+1 tokens, the block head from the anchor.
                 ctx = tokens[:, :self.cfg.seq_len]
                 main_tokens = tokens[:, :self.cfg.seq_len + 1]
-                logits, features, blog = model.forward_block(
-                    ctx, bn, teacher_states=states)
+                with self._amp():
+                    logits, features, blog = model.forward_block(
+                        ctx, bn, teacher_states=states)
                 loss, parts = distillation_losses(
                     logits, main_tokens, features,
                     model.embedding.weight, tp, ti,
@@ -209,7 +220,9 @@ class Trainer:
                 loss = loss + self.cfg.block_weight * block_ce
                 parts["block_ce"] = float(block_ce.detach())
             else:
-                logits, features = model(tokens[:, :-1], teacher_states=states)
+                with self._amp():
+                    logits, features = model(
+                        tokens[:, :-1], teacher_states=states)
                 loss, parts = distillation_losses(
                     logits, tokens, features,
                     model.embedding.weight, tp, ti,
@@ -241,9 +254,16 @@ class Trainer:
     def save(self, step: int):
         if not self.out_dir:
             raise RuntimeError("no out_dir configured")
+        dt = str(self.cfg.train_dtype).lower()
+        sd = self.model.state_dict()
+        if dt in ("fp16", "bf16"):
+            # Phase-A artifacts are half precision (masters live in the
+            # optimizer state during the run).
+            half = torch.float16 if dt == "fp16" else torch.bfloat16
+            sd = {k: v.to(half) for k, v in sd.items()}
         torch.save({
             "step": step,
-            "model": self.model.state_dict(),
+            "model": sd,
             "optimizer": self.opt.state_dict(),
             "train_cfg": vars(self.cfg),
             "config": self.model.config.summary(),
@@ -432,5 +452,19 @@ class Trainer:
                                acceptance_delta_pt=1.0, _acceptance=_acc)
         log(f"[ptqr] fidelity: top1_mismatch={report['top1_mismatch']} "
             f"pass={report['all_pass']}")
+        if self.out_dir:
+            # The annealed INT8 tier is the deliverable: masters are saved so
+            # a deterministic dither=0 re-quantization reproduces the served
+            # codes exactly (see export_model(..., dtype="int8")).
+            torch.save({
+                "step": self.cfg.steps,
+                "model": quantized.state_dict(),
+                "tier": "int8",
+                "dither": 0.0,
+                "train_cfg": vars(self.cfg),
+                "config": self.model.config.summary(),
+                "fidelity": report,
+            }, self.out_dir / "ckpt_ptqr.pt")
+            log(f"[ptqr] saved {self.out_dir / 'ckpt_ptqr.pt'}")
         return {"history": history, "quantized": quantized,
                 "fidelity": report, "final": history[-1], "initial": history[0]}

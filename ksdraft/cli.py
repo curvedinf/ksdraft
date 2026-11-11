@@ -59,6 +59,8 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="parallel block-draft offsets to supervise")
     p_train.add_argument("--block-weight", type=float, default=None)
     p_train.add_argument("--block-only-steps", type=int, default=0)
+    p_train.add_argument("--train-dtype", default=None,
+                         choices=["fp16", "bf16", "fp32"])
     p_train.add_argument("--lr", type=float, default=None,
                          help="override the recipe peak learning rate")
     p_train.add_argument("--warmup-steps", type=int, default=None)
@@ -76,6 +78,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--checkpoint", default=None)
     p_export.add_argument("--device", default="cpu")
     p_export.add_argument("--out", default="runs/export")
+    p_export.add_argument("--dtype", default="fp16",
+                          choices=["fp16", "bf16", "fp32", "int8"],
+                          help="artifact dtype (int8 stores codes+scales)")
 
     return parser
 
@@ -202,6 +207,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
         block_weight=(args.block_weight if args.block_weight is not None
                       else TrainConfig.block_weight),
         block_only_steps=args.block_only_steps,
+        train_dtype=(args.train_dtype if args.train_dtype is not None
+                     else TrainConfig.train_dtype),
     )
     trainer = Trainer(model, teacher, sampler, tcfg, device=args.device,
                       out_dir=args.out)
@@ -223,9 +230,11 @@ def _load_model(args) -> "object":
     n_taps = len((tspec.get("state_taps") or [6, 14, 22, 30, 38, 48]))
     d_tap = int(tspec.get("fixture_d_tap", 64))
     state = None
+    tier = None
     if getattr(args, "checkpoint", None):
         sd = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         state = sd["model"] if "model" in sd else sd
+        tier = sd.get("tier") if isinstance(sd, dict) else None
     # Teacher conditioning is a property of the checkpoint, not the recipe:
     # drafts trained with logits-only teachers have no teacher_proj.
     teacher_dim = (n_taps * d_tap
@@ -234,6 +243,11 @@ def _load_model(args) -> "object":
                    else 0)
     model = KSDraftModel(cfg, teacher_dim=teacher_dim)
     if state is not None:
+        # A PTQR checkpoint holds the converted module tree (KS3Int8Cell,
+        # Int8Linear); the plain model's keys do not match it.
+        if tier == "int8" or any(k.endswith(".weight_codes") for k in state):
+            from .model import to_int8
+            model = to_int8(model)
         missing, _ = model.load_state_dict(state, strict=False)
         if missing:
             print(f"[load] {len(missing)} new parameter(s) fresh: {missing[:3]}")
@@ -255,7 +269,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
     from .export import export_model
 
     model = _load_model(args).to(args.device)
-    path = export_model(model, args.out)
+    path = export_model(model, args.out, dtype=args.dtype)
     print(f"exported -> {path}")
     return 0
 

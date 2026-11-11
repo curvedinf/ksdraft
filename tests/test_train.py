@@ -88,7 +88,10 @@ def _run_trainer(stage, steps=30, tmp_path=None):
     ids = _biased_ids(20000, 256, seed=1)
     sampler = WindowSampler(ids, seq_len=32, seed=11)
     tcfg = TrainConfig(steps=steps, seq_len=32, batch_size=4, warmup=5,
-                       peak_lr=3e-3, val_every=10**6)
+                       peak_lr=3e-3, val_every=10**6,
+                       # exact roundtrip is the test's contract; fp16
+                       # checkpoints are covered by the artifact test
+                       train_dtype="fp32")
     tr = Trainer(model, teacher, sampler, tcfg, device="cpu", out_dir=tmp_path)
     log = io.StringIO()
     res = tr.train(stage=stage, log=lambda m: print(m, file=log))

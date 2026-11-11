@@ -18,7 +18,8 @@ from .config import KSDraftConfig
 from .model import KSDraftModel
 
 
-def export_model(model: KSDraftModel, out_dir: str) -> Path:
+def export_model(model: KSDraftModel, out_dir: str,
+                 dtype: str = "fp16") -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     c = model.config
@@ -35,13 +36,37 @@ def export_model(model: KSDraftModel, out_dir: str) -> Path:
         "torch_dtype": "float32",
         "max_position_embeddings": 4096,
         "dtype_tiers": ["int8", "bf16", "fp32"],
+        "dtype": dtype,
         "config": c.summary(),
     }
     if getattr(model, "teacher_dim", 0):
         meta["teacher_dim"] = model.teacher_dim
     (out / "config.json").write_text(json.dumps(meta, indent=2))
 
-    sd = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
+    if dtype == "int8":
+        from .kernels.linear import Int8Linear
+        from .model import to_int8
+
+        model = to_int8(model)
+        sd = {}
+        skip = set()
+        for name, mod in model.named_modules():
+            if isinstance(mod, Int8Linear):
+                sd[f"{name}.weight_codes"] = mod.weight_codes.detach().cpu().contiguous()
+                sd[f"{name}.weight_scales"] = mod.weight_scales.detach().cpu().float()
+                skip.add(f"{name}.weight")
+        for k, v in model.state_dict().items():
+            if k in skip:
+                continue
+            dt = torch.float16 if v.is_floating_point() else v.dtype
+            sd[k] = v.detach().cpu().to(dt).contiguous()
+    else:
+        sd = {k: v.detach().cpu().contiguous()
+              for k, v in model.state_dict().items()}
+        if dtype in ("fp16", "bf16"):
+            half = torch.float16 if dtype == "fp16" else torch.bfloat16
+            sd = {k: (v.to(half) if v.is_floating_point() else v)
+                  for k, v in sd.items()}
     if model.head.weight is model.embedding.weight:
         sd.pop("head.weight", None)  # safetensors forbids shared storage; retied on load
     try:
@@ -70,11 +95,26 @@ def load_export(out_dir: str, device: str = "cpu") -> KSDraftModel:
     st_path = out / "ksdraft.safetensors"
     if st_path.exists():
         from safetensors.torch import load_file
-        sd = load_file(str(st_path))
-        if "head.weight" not in sd:
-            sd["head.weight"] = sd["embedding.weight"]  # restore the tie
+        sd = dict(load_file(str(st_path)))
     else:
-        sd = torch.load(out / "ksdraft.pt", map_location=device)
+        sd = dict(torch.load(out / "ksdraft.pt", map_location="cpu"))
+
+    if meta.get("dtype") == "int8":
+        from .kernels.quant import dequantize_last_dim
+        from .model import to_int8
+
+        model = to_int8(model)
+        # Rebuild masters from the stored codes+scales: dither=0 quantization
+        # of the dequantized masters reproduces the exported codes exactly.
+        for k in [k for k in sd if k.endswith(".weight_codes")]:
+            path = k[: -len(".weight_codes")]
+            codes = sd.pop(k)
+            scales = sd.pop(path + ".weight_scales")
+            sd[path + ".weight"] = dequantize_last_dim(
+                codes.float(), scales.float())
+    if "head.weight" not in sd and "embedding.weight" in sd:
+        sd["head.weight"] = sd["embedding.weight"]  # restore the tie
+
     # Exports made before the parallel block head (or other new surfaces)
     # load with those parameters freshly initialized.
     missing, _ = model.load_state_dict(sd, strict=False)
