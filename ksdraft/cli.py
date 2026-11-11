@@ -234,7 +234,9 @@ def _load_model(args) -> "object":
                    else 0)
     model = KSDraftModel(cfg, teacher_dim=teacher_dim)
     if state is not None:
-        model.load_state_dict(state)
+        missing, _ = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"[load] {len(missing)} new parameter(s) fresh: {missing[:3]}")
     return model
 
 
