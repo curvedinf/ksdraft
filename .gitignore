@@ -19,7 +19,7 @@ htmlcov/
 runs/
 logs/
 checkpoints/
-data/
+/data/
 *.pt
 *.safetensors
 *.gguf

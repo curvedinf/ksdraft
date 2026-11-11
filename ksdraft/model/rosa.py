@@ -118,6 +118,16 @@ class RosaMixer(nn.Module):
         self.time_mix_k = nn.Parameter(torch.zeros(d_model))
         self.time_mix_v = nn.Parameter(torch.zeros(d_model))
         self.payload = nn.Parameter(torch.ones(streams))
+        # Training-mode gradient path for the hard symbol core:
+        #   "exact"  — batched counterfactual credits (HardRosaGPU; O(T^4),
+        #              capped at T <= 63; the parity reference, used by gates
+        #              and short fine-tunes)
+        #   "engine" — external exact credit engine when available
+        #   "ste"    — straight-through estimator: forward value is the exact
+        #              hard match, backward is the identity on the
+        #              projections (and therefore on the time mixes). This is
+        #              the only mode fast enough for full training.
+        self.credit_mode = "ste"
 
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
@@ -143,23 +153,90 @@ class RosaMixer(nn.Module):
         q_in, k_in, v_in = self._shifted(x)
         if self.training:
             q_full, k_full, v_full = self.q_proj(q_in), self.k_proj(k_in), self.v_proj(v_in)
-            if x.is_cuda:
-                from ..kernels.rosa_credit_gpu import HardRosaGPU
-                hard = HardRosaGPU.apply(q_full, k_full, v_full, self.payload)
-                return self.out_proj(hard.to(x.dtype))
-            from ..kernels.rosa_credit import engine_available, rosa_credit_forward
-            if engine_available():
-                hard = rosa_credit_forward(q_full, k_full, v_full, self.payload)
-                return self.out_proj(hard.to(x.dtype))
-        else:
-            q_full = k_full = v_full = None
+            mode = getattr(self, "credit_mode", "ste")
+            if mode == "exact":
+                from ..kernels.rosa_credit_gpu import MAX_WINDOW, HardRosaGPU
+                if q_full.shape[1] <= MAX_WINDOW:
+                    hard = HardRosaGPU.apply(q_full, k_full, v_full, self.payload)
+                    return self.out_proj(hard.to(x.dtype))
+            if mode in ("exact", "engine"):
+                from ..kernels.rosa_credit import engine_available, rosa_credit_forward
+                if engine_available():
+                    hard = rosa_credit_forward(q_full, k_full, v_full, self.payload)
+                    return self.out_proj(hard.to(x.dtype))
+            # STE: exact hard forward, identity gradient on the projections.
+            # Adding (x - x.detach()) leaves the value unchanged (numerically
+            # zero) while giving the projections/time mixes a gradient.
+            bits = ((q_full > 0).to(torch.int8).permute(0, 2, 1),
+                    (k_full > 0).to(torch.int8).permute(0, 2, 1),
+                    (v_full > 0).to(torch.int8).permute(0, 2, 1))
+            sign = _match_payload_sign_fast(*bits)                # (B, S, T)
+            hard = (self.payload[None, :, None] * sign).permute(0, 2, 1)
+            hard = hard + (q_full - q_full.detach()) \
+                        + (k_full - k_full.detach()) \
+                        + (v_full - v_full.detach())
+            return self.out_proj(hard.to(x.dtype))
+        q_full = k_full = v_full = None
         qbits = (self.q_proj(q_in) > 0).to(torch.int8)   # (B, T, S)
         kbits = (self.k_proj(k_in) > 0).to(torch.int8)
         vbits = (self.v_proj(v_in) > 0).to(torch.int8)
 
         # per-stream match over (B, S) leading dims
-        sign = _match_payload_sign(
+        sign = _match_payload_sign_fast(
             qbits.permute(0, 2, 1), kbits.permute(0, 2, 1), vbits.permute(0, 2, 1)
         )  # (B, S, T)
         out = self.payload[None, :, None] * sign         # (B, S, T) fp32
         return self.out_proj(out.permute(0, 2, 1).to(x.dtype))
+
+
+def _match_payload_sign_fast(
+    qbits: torch.Tensor, kbits: torch.Tensor, vbits: torch.Tensor,
+    max_match_len: int | None = None,
+) -> torch.Tensor:
+    """Longest-suffix-match payload signs, O(T^2) DP instead of O(T^3) codes.
+
+    ``lcs[t, j]`` = length of the longest common suffix of ``q[..t]`` and
+    ``k[..j]``: ``lcs = (q[t] == k[j]) ? lcs[t-1, j-1] + 1 : 0``. For each
+    position the longest length with any ``j < t`` decides, and among those
+    the latest ``j`` provides the successor value bit. Same semantics as
+    :func:`_match_payload_sign` (which is the rolling-int64 reference), with
+    the same ``max_match_len`` cap for parity.
+    """
+    *lead, t_len = qbits.shape
+    device = qbits.device
+    if max_match_len is None:
+        max_match_len = max(1, min(62, t_len - 1)) if t_len > 1 else 0
+    else:
+        max_match_len = min(max_match_len, max(t_len - 1, 0))
+
+    sign = torch.full(lead + [t_len], -1.0, device=device, dtype=torch.float32)
+    if max_match_len < 1:
+        return sign
+
+    q = qbits.float()
+    k = kbits.float()
+    v = vbits.float()
+    prev = torch.zeros(lead + [t_len], device=device, dtype=torch.float32)
+    for t in range(t_len):
+        # lcs[t, j] for every j: (q[t] == k[j]) * (lcs[t-1, j-1] + 1)
+        shifted = torch.cat(
+            [torch.zeros(lead + [1], device=device), prev[..., :-1]], dim=-1)
+        row = (q[..., t:t + 1] == k).float() * (shifted + 1.0)
+        if max_match_len:
+            row = row.clamp_max(float(max_match_len))
+        eligible = row.clone()
+        eligible[..., t:] = -1.0          # j must be strictly earlier than t
+        best = eligible.max(dim=-1)
+        m = best.values
+        has = m > 0
+        if bool(has.any()):
+            latest = torch.where(
+                eligible == m.unsqueeze(-1),
+                torch.arange(t_len, device=device).expand_as(eligible),
+                torch.full_like(eligible, -1)).max(dim=-1).values
+            succ = (latest.clamp_min(0) + 1).clamp_max(t_len - 1).long()
+            v_succ = torch.gather(v, -1, succ.unsqueeze(-1)).squeeze(-1)
+            v_sign = torch.where(v_succ > 0, 1.0, -1.0)
+            sign[..., t] = torch.where(has, v_sign, sign[..., t])
+        prev = row
+    return sign

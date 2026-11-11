@@ -23,6 +23,11 @@ from ksdraft.kernels.ks3_int8 import KS3Int8Cell
 REF_REPO = Path.home() / "Projects/k-splanifolds"
 pytestmark = pytest.mark.skipif(
     not REF_REPO.exists(), reason="k-splanifolds reference checkout not present")
+if not REF_REPO.exists():
+    # The marker skips the tests, but the reference import below would fail
+    # at collection time before it applies; skip the module here instead.
+    pytest.skip("k-splanifolds reference checkout not present",
+                allow_module_level=True)
 
 sys.path.insert(0, str(REF_REPO))
 from experiments.common.ks3 import KS3 as RefKS3          # noqa: E402
