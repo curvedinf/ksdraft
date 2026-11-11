@@ -58,6 +58,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--block-n", type=int, default=0,
                          help="parallel block-draft offsets to supervise")
     p_train.add_argument("--block-weight", type=float, default=None)
+    p_train.add_argument("--block-only-steps", type=int, default=0)
     p_train.add_argument("--lr", type=float, default=None,
                          help="override the recipe peak learning rate")
     p_train.add_argument("--warmup-steps", type=int, default=None)
@@ -200,6 +201,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
         block_n=args.block_n,
         block_weight=(args.block_weight if args.block_weight is not None
                       else TrainConfig.block_weight),
+        block_only_steps=args.block_only_steps,
     )
     trainer = Trainer(model, teacher, sampler, tcfg, device=args.device,
                       out_dir=args.out)

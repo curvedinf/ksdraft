@@ -47,6 +47,10 @@ class TrainConfig:
     # one forward (the serving proposal path; 0 disables the block head).
     block_n: int = 0
     block_weight: float = 1.0
+    # Head-only phase: train only the block offsets for this many steps so
+    # the new head cannot disturb the (already trained) next-token backbone;
+    # the backbone unfreezes afterwards.
+    block_only_steps: int = 0
     val_every: int = 50
     seed: int = 11
 
@@ -164,6 +168,12 @@ class Trainer:
             return self._train_ptqr(log)
         model = self.model
         model.train()
+        block_only = int(self.cfg.block_only_steps) if self.cfg.block_n else 0
+        if block_only:
+            for name, prm in model.named_parameters():
+                prm.requires_grad_(name.startswith("block_delta"))
+            print(f"[{stage}] block-head-only warmup for {block_only} steps",
+                  flush=True)
         use_teacher = stage == "distill" and self.teacher is not None
         history = []
         for step in range(self.cfg.steps):
@@ -206,6 +216,10 @@ class Trainer:
                     self.cfg.transfer_weight,
                     self.cfg.kl_weight if use_teacher else 0.0,
                     self.cfg.wtv_weight if use_teacher else 0.0)
+            if block_only and step == block_only:
+                for prm in model.parameters():
+                    prm.requires_grad_(True)
+                print(f"[{stage}] backbone unfrozen at step {step}", flush=True)
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.grad_clip)
