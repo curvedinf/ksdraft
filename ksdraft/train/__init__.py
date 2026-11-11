@@ -180,21 +180,32 @@ class Trainer:
                 flat = sig.states.flatten(2) if sig.states is not None else None
                 states = flat
                 tp, ti = sig.topk_probs, sig.topk_ids
-            logits, features = model(tokens[:, :-1], teacher_states=states)
-            loss, parts = distillation_losses(
-                logits, tokens, features,
-                model.embedding.weight, tp, ti,
-                self.cfg.transfer_weight,
-                self.cfg.kl_weight if use_teacher else 0.0,
-                self.cfg.wtv_weight if use_teacher else 0.0)
             if bn > 0:
+                # One trunk pass for both objectives: the main CE over the
+                # first seq_len+1 tokens, the block head from the anchor.
                 ctx = tokens[:, :self.cfg.seq_len]
+                main_tokens = tokens[:, :self.cfg.seq_len + 1]
+                logits, features, blog = model.forward_block(
+                    ctx, bn, teacher_states=states)
+                loss, parts = distillation_losses(
+                    logits, main_tokens, features,
+                    model.embedding.weight, tp, ti,
+                    self.cfg.transfer_weight,
+                    self.cfg.kl_weight if use_teacher else 0.0,
+                    self.cfg.wtv_weight if use_teacher else 0.0)
                 tgt = tokens[:, self.cfg.seq_len:self.cfg.seq_len + bn]
-                blog = model.block_logits(ctx, bn)
                 block_ce = F.cross_entropy(
                     blog.flatten(0, 1).float(), tgt.flatten())
                 loss = loss + self.cfg.block_weight * block_ce
                 parts["block_ce"] = float(block_ce.detach())
+            else:
+                logits, features = model(tokens[:, :-1], teacher_states=states)
+                loss, parts = distillation_losses(
+                    logits, tokens, features,
+                    model.embedding.weight, tp, ti,
+                    self.cfg.transfer_weight,
+                    self.cfg.kl_weight if use_teacher else 0.0,
+                    self.cfg.wtv_weight if use_teacher else 0.0)
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.grad_clip)

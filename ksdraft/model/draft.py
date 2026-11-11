@@ -90,6 +90,20 @@ class KSDraftModel(nn.Module):
         h, features = self.trunk(tokens, teacher_states)
         return self.head(h), features
 
+    def forward_block(self, tokens: torch.Tensor, n: int,
+                      teacher_states: torch.Tensor | None = None
+                      ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+        """One trunk pass returning (logits, features, block logits).
+
+        Training uses this so the block loss does not pay a second trunk
+        forward (memory and time); serving uses block_logits().
+        """
+        h, features = self.trunk(tokens, teacher_states)
+        logits = self.head(h)
+        anchor = h[:, -1]
+        hs = anchor.unsqueeze(1) + self.block_delta[:n].unsqueeze(0)
+        return logits, features, hs @ self.head.weight.t()
+
     def block_logits(self, tokens: torch.Tensor, n: int,
                      teacher_states: torch.Tensor | None = None
                      ) -> torch.Tensor:
