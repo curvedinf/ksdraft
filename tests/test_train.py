@@ -123,3 +123,29 @@ def test_checkpoint_roundtrip(tmp_path):
     with torch.no_grad():
         y2, _ = tr2.model(x)
     torch.testing.assert_close(y1, y2)
+
+
+def test_frozen_embedding_and_grad_accum(tmp_path):
+    """Frozen target embedding: no grad, no optimizer slot; accumulation runs."""
+    from ksdraft.config import KSDraftConfig
+    from ksdraft.model import KSDraftModel
+    from ksdraft.train import Trainer, TrainConfig, WindowSampler
+
+    torch.manual_seed(0)
+    cfg = KSDraftConfig(vocab_size=128, d_model=32, layers=2, head_size=16,
+                        rosa_streams=16, ks3_charts=64)
+    model = KSDraftModel(cfg)
+    ids = torch.randint(0, cfg.vocab_size, (4096,))
+    sampler = WindowSampler(ids, seq_len=16, seed=1)
+    tcfg = TrainConfig(steps=4, seq_len=16, batch_size=4, warmup=1,
+                       peak_lr=3e-3, val_every=10**6, block_n=4,
+                       block_weight=0.25, train_dtype="fp32",
+                       freeze_embeddings=True, grad_accum=2)
+    tr = Trainer(model, None, sampler, tcfg, device="cpu", out_dir=tmp_path)
+    res = tr.train(stage="warmup", log=lambda m: None)
+    assert tr.model.embedding.weight.grad is None
+    assert not tr.model.embedding.weight.requires_grad
+    assert tr.model.head.weight is tr.model.embedding.weight
+    assert all(p.shape != (cfg.vocab_size, cfg.d_model)
+               for g in tr.opt.param_groups for p in g["params"])
+    assert res["final"]["loss"] == res["final"]["loss"]  # finite

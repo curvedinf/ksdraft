@@ -51,6 +51,31 @@ class TrainConfig:
     # the new head cannot disturb the (already trained) next-token backbone;
     # the backbone unfreezes afterwards.
     block_only_steps: int = 0
+    # Block objective position weighting (EAGLE-4 0.8^i shape): offsets that
+    # survive verification early dominate acceptance length.
+    block_position_decay: float = 1.0
+    # Schedule: "cosine" (reference) or "wsd" (warmup-stable-decay, the
+    # speedrun-proven shape for longer runs / late annealing).
+    lr_schedule: str = "cosine"
+    lr_decay_frac: float = 0.7
+    # Tail weight averaging (speedrun #92): an EMA model is written next to
+    # the final checkpoint; 0 disables.
+    ema_decay: float = 0.0
+    # Split optimizer: Muon for the 2D hidden matrices, AdamW for embeddings,
+    # norms, biases and the structured tables (torch 2.11 built-in).
+    muon: bool = False
+    muon_lr: float = 2e-3
+    muon_weight_decay: float = 0.01
+    # Chunk size for the low-memory head losses.
+    head_chunk: int = 128
+    # Micro-batches per optimizer step: raises the effective batch without
+    # the activation memory of a single large batch (tok/s is unchanged).
+    grad_accum: int = 1
+    # EAGLE/Quark recipe: the tied embedding (and therefore the head) starts
+    # from the target's SVD projection and stays frozen. It removes 30% of
+    # the trainable parameters and stops a 7M-token corpus from trying to
+    # learn token semantics from scratch.
+    freeze_embeddings: bool = False
     # Phase A compute/checkpoint dtype: fp16 (decided), bf16, or fp32. The
     # late PTQR stage converts to the int8 tier for annealing.
     train_dtype: str = "fp16"
@@ -60,22 +85,68 @@ class TrainConfig:
 
 class WindowSampler:
     """Random contiguous windows from a flat token stream (zero Rosa state
-    at window start — matches the k-splanifolds byte-LM protocol)."""
+    at window start — matches the k-splanifolds byte-LM protocol).
 
-    def __init__(self, ids: list[int], seq_len: int, seed: int = 11):
+    With ``boundaries`` (document start offsets, as produced by
+    :func:`detect_boundaries`), windows are sampled inside a single document
+    and never cross a role/document boundary. The speedrun recipe aligns
+    batches to EoS for the same reason: a window whose target is the first
+    token of an unrelated document teaches the drafter noise.
+    """
+
+    def __init__(self, ids: list[int] | torch.Tensor, seq_len: int,
+                 seed: int = 11,
+                 boundaries: torch.Tensor | list[int] | None = None):
         if len(ids) <= seq_len + 1:
             raise ValueError("corpus too short for the window size")
         self.ids = (ids.detach().to(torch.long).cpu() if isinstance(ids, torch.Tensor)
                     else torch.tensor(ids, dtype=torch.long))
         self.seq_len = seq_len
         self.g = torch.Generator().manual_seed(seed)
+        self.starts = None
+        if boundaries is not None:
+            b = (boundaries.detach().to(torch.long).cpu()
+                 if isinstance(boundaries, torch.Tensor)
+                 else torch.tensor(boundaries, dtype=torch.long))
+            b = b[(b >= 0) & (b < len(self.ids))]
+            b = torch.unique(torch.cat([torch.zeros(1, dtype=torch.long), b]))
+            self.starts = b
+
+    def _span(self, extra: int) -> int:
+        return self.seq_len + 1 + extra
 
     def batch(self, batch_size: int, extra: int = 0) -> torch.Tensor:
-        span = self.seq_len + 1 + extra
-        idx = torch.randint(0, len(self.ids) - span, (batch_size,),
-                            generator=self.g)
+        span = self._span(extra)
+        if self.starts is None:
+            idx = torch.randint(0, len(self.ids) - span, (batch_size,),
+                                generator=self.g)
+        else:
+            starts = self.starts
+            ends = torch.cat([starts[1:], torch.tensor([len(self.ids)])])
+            lens = ends - starts
+            ok = lens >= span
+            starts, lens = starts[ok], lens[ok]
+            if starts.numel() == 0:
+                raise ValueError("no document is long enough for this window")
+            pick = torch.randint(0, starts.numel(), (batch_size,),
+                                 generator=self.g)
+            max_off = lens[pick] - span
+            off = (torch.rand(batch_size, generator=self.g) * (max_off + 1)).long()
+            idx = starts[pick] + off
         ar = torch.arange(span)
         return self.ids[idx[:, None] + ar[None, :]]
+
+
+def detect_boundaries(ids: torch.Tensor,
+                      separator: list[int] | torch.Tensor) -> torch.Tensor:
+    """Document starts for a corpus formatted with a repeated separator
+    (e.g. the chat-template turn marker or ``### Instruction:``)."""
+    ids = ids.to(torch.long).cpu()
+    sep = torch.as_tensor(separator, dtype=torch.long)
+    if sep.numel() == 0 or sep.numel() > ids.numel():
+        return torch.zeros(0, dtype=torch.long)
+    hit = (ids.unfold(0, sep.numel(), 1) == sep).all(-1).nonzero().flatten()
+    return hit
 
 
 def distillation_losses(
@@ -134,21 +205,52 @@ class Trainer:
         self.out_dir = Path(out_dir) if out_dir else None
         if self.out_dir:
             self.out_dir.mkdir(parents=True, exist_ok=True)
+        if cfg.freeze_embeddings:
+            self.model.embedding.weight.requires_grad_(False)
+        self.opt_muon = None
+        if cfg.muon and device != "cpu":
+            muon_params, adam_params, muon_names = _split_muon(self.model)
+            try:
+                self.opt_muon = torch.optim.Muon(
+                    muon_params, lr=cfg.muon_lr,
+                    weight_decay=cfg.muon_weight_decay)
+            except (RuntimeError, TypeError) as exc:
+                print(f"[opt] Muon unavailable ({exc}); AdamW only", flush=True)
+                self.opt_muon = None
+                adam_params = [p for p in self.model.parameters()
+                               if p.requires_grad]
+            if self.opt_muon is not None:
+                print(f"[opt] Muon {len(muon_params)} tensors, AdamW "
+                      f"{len(adam_params)} (e.g. {muon_names[:2]})", flush=True)
+        else:
+            adam_params = [p for p in self.model.parameters()
+                           if p.requires_grad]
         try:
             # Fused AdamW: one kernel for the whole update (2.4x faster than
             # foreach on this stack); falls back on backends without it.
             self.opt = torch.optim.AdamW(
-                self.model.parameters(), lr=cfg.peak_lr,
+                adam_params, lr=cfg.peak_lr,
                 weight_decay=cfg.weight_decay, fused=True)
         except (RuntimeError, TypeError):
             self.opt = torch.optim.AdamW(
-                self.model.parameters(), lr=cfg.peak_lr,
+                adam_params, lr=cfg.peak_lr,
                 weight_decay=cfg.weight_decay)
+        self.ema = None
+        if cfg.ema_decay > 0:
+            self.ema = {name: p.detach().clone()
+                        for name, p in self.model.named_parameters()}
 
     def _lr_scale(self, step: int) -> float:
         c = self.cfg
         if step < c.warmup:
             return (step + 1) / max(1, c.warmup)
+        if str(c.lr_schedule).lower() == "wsd":
+            span = max(1, c.steps - c.warmup)
+            decay_start = c.warmup + int(span * (1.0 - c.lr_decay_frac))
+            if step < decay_start:
+                return 1.0
+            p = (step - decay_start) / max(1, c.steps - decay_start)
+            return c.min_lr_frac + (1 - c.min_lr_frac) * (1.0 - p)
         progress = (step - c.warmup) / max(1, c.steps - c.warmup)
         cos = 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
         return c.min_lr_frac + (1 - c.min_lr_frac) * cos
@@ -161,9 +263,12 @@ class Trainer:
         return torch.autocast(device_type="cuda", dtype=dtype)
 
     def _apply_lr(self, step: int):
-        lr = self.cfg.peak_lr * self._lr_scale(step)
+        scale = self._lr_scale(step)
         for g in self.opt.param_groups:
-            g["lr"] = lr
+            g["lr"] = self.cfg.peak_lr * scale
+        if self.opt_muon is not None:
+            for g in self.opt_muon.param_groups:
+                g["lr"] = self.cfg.muon_lr * scale
 
     def train(self, stage: str = "distill", log=print) -> dict:
         assert stage in ("warmup", "distill", "foresight", "refine",
@@ -186,57 +291,33 @@ class Trainer:
                   flush=True)
         use_teacher = stage == "distill" and self.teacher is not None
         history = []
+        accum = max(1, int(self.cfg.grad_accum))
         for step in range(self.cfg.steps):
             self._apply_lr(step)
-            bn = int(self.cfg.block_n)
-            batch = self.sampler.batch(
-                self.cfg.batch_size, extra=max(0, bn - 1)).to(self.device)
-            tokens = batch  # (B, T+1); inputs batch[:, :-1], targets batch[:, 1:]
-            states = None
-            tp = ti = None
-            if use_teacher:
-                sig = self.teacher.signals(tokens[:, :-1]).to(
-                    self.device, torch.float16 if self.device != "cpu" else torch.float32)
-                flat = sig.states.flatten(2) if sig.states is not None else None
-                states = flat
-                tp, ti = sig.topk_probs, sig.topk_ids
-            if bn > 0:
-                # One trunk pass for both objectives: the main CE over the
-                # first seq_len+1 tokens, the block head from the anchor.
-                ctx = tokens[:, :self.cfg.seq_len]
-                main_tokens = tokens[:, :self.cfg.seq_len + 1]
-                with self._amp():
-                    logits, features, blog = model.forward_block(
-                        ctx, bn, teacher_states=states)
-                loss, parts = distillation_losses(
-                    logits, main_tokens, features,
-                    model.embedding.weight, tp, ti,
-                    self.cfg.transfer_weight,
-                    self.cfg.kl_weight if use_teacher else 0.0,
-                    self.cfg.wtv_weight if use_teacher else 0.0)
-                tgt = tokens[:, self.cfg.seq_len:self.cfg.seq_len + bn]
-                block_ce = F.cross_entropy(
-                    blog.flatten(0, 1).float(), tgt.flatten())
-                loss = loss + self.cfg.block_weight * block_ce
-                parts["block_ce"] = float(block_ce.detach())
-            else:
-                with self._amp():
-                    logits, features = model(
-                        tokens[:, :-1], teacher_states=states)
-                loss, parts = distillation_losses(
-                    logits, tokens, features,
-                    model.embedding.weight, tp, ti,
-                    self.cfg.transfer_weight,
-                    self.cfg.kl_weight if use_teacher else 0.0,
-                    self.cfg.wtv_weight if use_teacher else 0.0)
             if block_only and step == block_only:
                 for prm in model.parameters():
                     prm.requires_grad_(True)
                 print(f"[{stage}] backbone unfrozen at step {step}", flush=True)
+            bn = int(self.cfg.block_n)
             self.opt.zero_grad(set_to_none=True)
-            loss.backward()
+            if self.opt_muon is not None:
+                self.opt_muon.zero_grad(set_to_none=True)
+            for micro in range(accum):
+                loss, parts = self._micro_loss(bn, use_teacher)
+                (loss / accum).backward()
+                if micro == accum - 1:
+                    break
+                del loss
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.grad_clip)
             self.opt.step()
+            if self.opt_muon is not None:
+                self.opt_muon.step()
+            if self.ema is not None:
+                with torch.no_grad():
+                    dcy = self.cfg.ema_decay
+                    for name, prm in model.named_parameters():
+                        e = self.ema[name]
+                        e.mul_(dcy).add_(prm.detach(), alpha=1.0 - dcy)
             rec = {"step": step, "loss": loss.item(), "grad_norm": float(gn), **parts}
             history.append(rec)
             if step % max(1, self.cfg.steps // 10) == 0 or step == self.cfg.steps - 1:
@@ -250,6 +331,69 @@ class Trainer:
                 self.save(step)
         return {"history": history,
                 "final": history[-1], "initial": history[0]}
+
+    def _micro_loss(self, bn: int, use_teacher: bool):
+        """One micro-batch forward/loss (shared by every accumulation slot)."""
+        model = self.model
+        batch = self.sampler.batch(
+            self.cfg.batch_size, extra=max(0, bn - 1)).to(self.device)
+        tokens = batch
+        states = None
+        tp = ti = None
+        if use_teacher:
+            sig = self.teacher.signals(tokens[:, :-1]).to(
+                self.device,
+                torch.float16 if self.device != "cpu" else torch.float32)
+            states = sig.states.flatten(2) if sig.states is not None else None
+            tp, ti = sig.topk_probs, sig.topk_ids
+        if bn > 0:
+            # Low-memory objective: chunked head losses, no V-sized logits
+            # tensors (see kernels/fused_train.py). Teacher KL / WTV run on
+            # the same chunks through the sparse-target path.
+            from ..kernels.fused_train import (block_position_weights,
+                                               linear_ce, linear_soft_ce,
+                                               wtv_from_logp)
+            ctx = tokens[:, :self.cfg.seq_len]
+            main_tokens = tokens[:, :self.cfg.seq_len + 1]
+            with self._amp():
+                h, features, hs = model.forward_block_hidden(
+                    ctx, bn, teacher_states=states)
+            d = h.shape[-1]
+            w = model.head.weight
+            tgt = tokens[:, self.cfg.seq_len:self.cfg.seq_len + bn]
+            ce, _ = linear_ce(h.reshape(-1, d), w,
+                              main_tokens[:, 1:].reshape(-1),
+                              None, self.cfg.head_chunk)
+            ts = transfer_alignment(features, model.embedding.weight,
+                                    main_tokens[:, 1:])
+            bw = block_position_weights(
+                bn, self.cfg.block_position_decay, h.device).repeat(h.shape[0])
+            bce, _ = linear_ce(hs.reshape(-1, d), w, tgt.reshape(-1), bw,
+                               self.cfg.head_chunk)
+            loss = ce + self.cfg.transfer_weight * ts \
+                + self.cfg.block_weight * bce
+            parts = {"ce": float(ce.detach()),
+                     "transfer": float(ts.detach()),
+                     "block_ce": float(bce.detach())}
+            if tp is not None and self.cfg.kl_weight > 0:
+                k = tp.shape[-1]
+                kl, topk_logp = linear_soft_ce(
+                    h.reshape(-1, d), w, ti.reshape(-1, k), tp.reshape(-1, k),
+                    None, self.cfg.head_chunk)
+                loss = loss + self.cfg.kl_weight * kl
+                parts["kl"] = float(kl.detach())
+                if self.cfg.wtv_weight > 0:
+                    wtv = wtv_from_logp(topk_logp, tp.reshape(-1, k))
+                    loss = loss + self.cfg.wtv_weight * wtv
+                    parts["wtv"] = float(wtv.detach())
+            return loss, parts
+        with self._amp():
+            logits, features = model(tokens[:, :-1], teacher_states=states)
+        return distillation_losses(
+            logits, tokens, features, model.embedding.weight, tp, ti,
+            self.cfg.transfer_weight,
+            self.cfg.kl_weight if use_teacher else 0.0,
+            self.cfg.wtv_weight if use_teacher else 0.0)
 
     def save(self, step: int):
         if not self.out_dir:
@@ -265,9 +409,17 @@ class Trainer:
             "step": step,
             "model": sd,
             "optimizer": self.opt.state_dict(),
+            "optimizer_muon": (self.opt_muon.state_dict()
+                               if self.opt_muon is not None else None),
             "train_cfg": vars(self.cfg),
             "config": self.model.config.summary(),
         }, self.out_dir / f"ckpt_{step:06d}.pt")
+        if self.ema is not None and step == self.cfg.steps - 1:
+            ema_sd = {k: v.to(sd[k].dtype) if k in sd else v
+                      for k, v in self.ema.items()}
+            torch.save({"step": step, "model": ema_sd, "ema": True,
+                        "config": self.model.config.summary()},
+                       self.out_dir / "ckpt_ema.pt")
 
     def load(self, path, map_location=None):
         ckpt = torch.load(path, map_location=map_location or self.device,
@@ -279,6 +431,11 @@ class Trainer:
         if missing:
             print(f"[load] {len(missing)} new parameter(s) initialized fresh: "
                   f"{missing[:3]}", flush=True)
+        if self.opt_muon is not None and ckpt.get("optimizer_muon"):
+            try:
+                self.opt_muon.load_state_dict(ckpt["optimizer_muon"])
+            except ValueError:
+                print("[load] Muon state incompatible; restarting it", flush=True)
         try:
             self.opt.load_state_dict(ckpt["optimizer"])
         except ValueError:
@@ -420,7 +577,10 @@ class Trainer:
             if hasattr(m, "_quantize_weight"):
                 m._dither = dither0
         for step in range(self.cfg.steps):
-            dither = dither0 * (0.5 ** (anneal_steps * step / max(1, self.cfg.steps)))
+            # Geometric anneal across the window, then dither=0 for the
+            # remaining 30% so the tier consolidates on the exact serving grid.
+            frac = min(1.0, step / anneal_steps)
+            dither = dither0 * (0.5 ** (20.0 * frac))
             for m in quantized.modules():
                 if hasattr(m, "_quantize_weight"):
                     m._dither = dither
@@ -468,3 +628,38 @@ class Trainer:
             log(f"[ptqr] saved {self.out_dir / 'ckpt_ptqr.pt'}")
         return {"history": history, "quantized": quantized,
                 "fidelity": report, "final": history[-1], "initial": history[0]}
+
+
+def transfer_alignment(features: list[torch.Tensor], embedding_weight: torch.Tensor,
+                       targets: torch.Tensor) -> torch.Tensor:
+    """DSpine transfer-space loss: per-layer predicted feature vs the next
+    token's target embedding (cosine), averaged over layers."""
+    tgt_emb = F.normalize(embedding_weight[targets].float(), dim=-1)
+    ts = 0.0
+    for f in features:
+        fn = F.normalize(f.float(), dim=-1)
+        ts = ts + (1 - (fn * tgt_emb).sum(-1)).mean()
+    return ts / max(1, len(features))
+
+
+def _split_muon(model: nn.Module):
+    """Muon owns the dense 2D hidden maps; AdamW keeps embeddings, norms,
+    biases and the structured tables (payloads, coefficients, offsets)."""
+    muon, adam, names = [], [], []
+    skip_tags = ("embedding", "block_delta", "coefficients", "raw_scale",
+                 "raw_shift")
+    for name, prm in model.named_parameters():
+        if not prm.requires_grad:
+            continue
+        # Newton-Schulz cost is ~min(m,n)^2 * max(m,n) per matrix; the 5888-wide
+        # KS3 maps would cost more than the whole rest of the step, so they
+        # stay on AdamW. Rosa/injection/feature maps (<= 4096 wide) qualify.
+        is_map = (prm.ndim == 2 and min(prm.shape) >= 2
+                  and max(prm.shape) <= 4096
+                  and not any(t in name for t in skip_tags))
+        if is_map:
+            muon.append(prm)
+            names.append(name)
+        else:
+            adam.append(prm)
+    return muon, adam, names

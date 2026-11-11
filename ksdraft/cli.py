@@ -61,6 +61,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--block-only-steps", type=int, default=0)
     p_train.add_argument("--train-dtype", default=None,
                          choices=["fp16", "bf16", "fp32"])
+    p_train.add_argument("--grad-accum", type=int, default=None)
+    p_train.add_argument("--muon", action="store_true", default=None)
+    p_train.add_argument("--muon-lr", type=float, default=None)
+    p_train.add_argument("--ema-decay", type=float, default=None)
+    p_train.add_argument("--lr-schedule", default=None,
+                         choices=["cosine", "wsd"])
+    p_train.add_argument("--block-position-decay", type=float, default=None)
+    p_train.add_argument("--embedding-init", default=None,
+                         help=".pt tensor [vocab, d_model] (target SVD projection)")
+    p_train.add_argument("--freeze-embeddings", action="store_true",
+                         default=None)
+    p_train.add_argument("--boundary-sep", default=None,
+                         help="comma-separated token ids marking a document "
+                              "start (windows never cross one)")
     p_train.add_argument("--lr", type=float, default=None,
                          help="override the recipe peak learning rate")
     p_train.add_argument("--warmup-steps", type=int, default=None)
@@ -171,6 +185,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
     from .train import Trainer, TrainConfig, WindowSampler
 
     cfg, tspec, trspec = _load_target_config(args.config)
+    bounds = None
     if args.corpus == "synthetic":
         ids = synthetic_ids(args.corpus_size, cfg.vocab_size)
     elif str(args.corpus).endswith(".pt"):
@@ -178,10 +193,18 @@ def _cmd_train(args: argparse.Namespace) -> int:
         # tensor so multi-million-token corpora do not become Python lists.
         ids = torch.load(args.corpus, map_location="cpu", weights_only=True)
         if isinstance(ids, dict):
+            bounds = ids.get("boundaries")
             ids = ids.get("tokens", ids.get("ids"))
     else:
         ids = json.loads(Path(args.corpus).read_text())
-    sampler = WindowSampler(ids, seq_len=args.seq_len or 64, seed=11)
+    if args.boundary_sep:
+        from .train import detect_boundaries
+        sep = [int(t) for t in str(args.boundary_sep).split(",") if t != ""]
+        bounds = detect_boundaries(
+            ids if isinstance(ids, torch.Tensor) else torch.tensor(ids), sep)
+        print(f"boundaries: {bounds.numel()} documents", flush=True)
+    sampler = WindowSampler(ids, seq_len=args.seq_len or 64, seed=11,
+                            boundaries=bounds)
 
     n_taps = len((tspec.get("state_taps") or [6, 14, 22, 30, 38, 48]))
     teacher = None
@@ -193,7 +216,11 @@ def _cmd_train(args: argparse.Namespace) -> int:
         teacher_dim = n_taps * d_tap
 
     torch.manual_seed(0)
-    model = KSDraftModel(cfg, teacher_dim=teacher_dim)
+    emb_init = None
+    if args.embedding_init:
+        emb_init = torch.load(args.embedding_init, map_location="cpu",
+                              weights_only=True)
+    model = KSDraftModel(cfg, teacher_dim=teacher_dim, embedding_init=emb_init)
     tcfg = TrainConfig(
         steps=args.steps or int(trspec.get("steps", 50)),
         seq_len=args.seq_len or 64,
@@ -209,6 +236,22 @@ def _cmd_train(args: argparse.Namespace) -> int:
         block_only_steps=args.block_only_steps,
         train_dtype=(args.train_dtype if args.train_dtype is not None
                      else TrainConfig.train_dtype),
+        grad_accum=(args.grad_accum if args.grad_accum is not None
+                    else TrainConfig.grad_accum),
+        muon=(bool(args.muon) if args.muon is not None
+              else TrainConfig.muon),
+        muon_lr=(args.muon_lr if args.muon_lr is not None
+                 else TrainConfig.muon_lr),
+        ema_decay=(args.ema_decay if args.ema_decay is not None
+                   else TrainConfig.ema_decay),
+        lr_schedule=(args.lr_schedule if args.lr_schedule is not None
+                     else TrainConfig.lr_schedule),
+        block_position_decay=(args.block_position_decay
+                              if args.block_position_decay is not None
+                              else TrainConfig.block_position_decay),
+        freeze_embeddings=(bool(args.freeze_embeddings)
+                           if args.freeze_embeddings is not None
+                           else TrainConfig.freeze_embeddings),
     )
     trainer = Trainer(model, teacher, sampler, tcfg, device=args.device,
                       out_dir=args.out)

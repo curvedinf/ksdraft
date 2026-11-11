@@ -636,11 +636,26 @@ supervision is available on demand, (c) training is **native INT8 end-to-end**
   Rosa analog of H-Spec's seeding is projecting the last-token target state into
   the recurrent state at block start.
 - Small-weight KL to teacher top-k logits as a secondary loss.
-- **Optimization:** AdamW, cosine schedule, peak ~3e-4 (DCOCO used 6e-4 at ~400M;
-  scale down modestly for 1B), warmup, grad-norm clip 1.0. Budget: order 5–10B
-  teacher tokens.
+- **Optimization (2026-11-11 update):** fused AdamW by default, with an
+  optional split Muon run (torch 2.11 built-in) for the dense 2D hidden maps;
+  embeddings, norms, biases and the structured tables (payloads, coefficients,
+  dtables) stay on AdamW. Cosine or warmup-stable-decay (WSD) schedule, peak
+  ~1e-4–3e-4, warmup, grad-norm clip 1.0, gradient accumulation for effective
+  batches above the ~96-sample activation limit. Tail EMA is written as
+  `ckpt_ema.pt`. The KS3 5888-wide maps stay on AdamW: Newton–Schulz cost is
+  min(m,n)^2 * max(m,n) and would exceed the rest of the step.
 - **Numerics:** fully INT8 forward/backward, FP16 gradient handoff; rounding dither
   ON (PTQR exploration phase — early training explores neighboring grid points).
+- **Data alignment:** windows are sampled inside a single document
+  (`WindowSampler(..., boundaries=...)`, `detect_boundaries`), never across a
+  role/document boundary.
+- **Initialization:** the tied embedding starts from the target's rank-1536 SVD
+  projection (`scripts/init_embedding.py`, Gram correlation 0.999) and can be
+  frozen (`--freeze-embeddings`), the EAGLE-3.x / AMD Quark recipe; that removes
+  230M trainable parameters and the dominant head weight-gradient traffic.
+- **Block objective:** per-offset weights (`block_position_decay`, EAGLE-4
+  0.8^i shape) instead of uniform offsets; teacher KL + WTV run on the same
+  chunked head (`linear_soft_ce`, `wtv_from_logp`), no full-vocab logits.
 
 ### Stage 3 — Corrector stage (conditional; DCOCO fallback path)
 - Only if the DCOCO-style parallel contextual corrector is activated (fallback if

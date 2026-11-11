@@ -25,7 +25,8 @@ from .block import DraftBlock
 
 class KSDraftModel(nn.Module):
     def __init__(self, config: KSDraftConfig | None = None, teacher_dim: int = 0,
-                 device: torch.device | str | None = None, skip_init: bool = False):
+                 device: torch.device | str | None = None, skip_init: bool = False,
+                 embedding_init: torch.Tensor | None = None):
         super().__init__()
         cfg = config or KSDraftConfig()
         self.config = cfg
@@ -60,6 +61,10 @@ class KSDraftModel(nn.Module):
             nn.init.uniform_(self.embedding.weight, -1e-4, 1e-4)
             if self.teacher_proj is not None:
                 nn.init.zeros_(self.teacher_proj.weight)
+        if embedding_init is not None:
+            with torch.no_grad():
+                self.embedding.weight.copy_(embedding_init.to(
+                    self.embedding.weight.dtype))
 
     def trunk(self, tokens: torch.Tensor,
               teacher_states: torch.Tensor | None = None
@@ -90,6 +95,20 @@ class KSDraftModel(nn.Module):
         h, features = self.trunk(tokens, teacher_states)
         return self.head(h), features
 
+    def forward_block_hidden(self, tokens: torch.Tensor, n: int,
+                             teacher_states: torch.Tensor | None = None
+                             ) -> tuple[torch.Tensor, list[torch.Tensor],
+                                        torch.Tensor]:
+        """Trunk pass returning (hidden, features, block hidden states).
+
+        Training projects these through the chunked head losses so the full
+        vocab logits are never materialized (see kernels/fused_train.py).
+        """
+        h, features = self.trunk(tokens, teacher_states)
+        anchor = h[:, -1]
+        hs = anchor.unsqueeze(1) + self.block_delta[:n].unsqueeze(0)
+        return h, features, hs
+
     def forward_block(self, tokens: torch.Tensor, n: int,
                       teacher_states: torch.Tensor | None = None
                       ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
@@ -98,11 +117,8 @@ class KSDraftModel(nn.Module):
         Training uses this so the block loss does not pay a second trunk
         forward (memory and time); serving uses block_logits().
         """
-        h, features = self.trunk(tokens, teacher_states)
-        logits = self.head(h)
-        anchor = h[:, -1]
-        hs = anchor.unsqueeze(1) + self.block_delta[:n].unsqueeze(0)
-        return logits, features, hs @ self.head.weight.t()
+        h, features, hs = self.forward_block_hidden(tokens, n, teacher_states)
+        return self.head(h), features, hs @ self.head.weight.t()
 
     def block_logits(self, tokens: torch.Tensor, n: int,
                      teacher_states: torch.Tensor | None = None
