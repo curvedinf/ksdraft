@@ -44,6 +44,17 @@ training:                     # RESEARCH.md Section 11
   optimizer: {kind: adamw, peak_lr: 3.0e-4, schedule: cosine, grad_clip: 1.0}
   token_budget: 7.5e9         # order 5-10B teacher tokens
 
+on_policy:                    # 2026-11-11: target-regenerated corpus
+  corpus: runs/onpolicy_ready/train_tokens.pt   # tokens + boundaries
+  teacher_cache: runs/onpolicy_teacher.pt      # top-k at T=1, top-p .95/top-k 20
+  steps: 2000                 # B=256 x 21 tokens = 10.7M (4.5 epochs)
+  batch_size: 256
+  embedding_init: runs/embedding_init.pt       # rank-1536 target SVD
+  freeze_embeddings: true                      # EAGLE/Quark recipe
+  lr_schedule: wsd
+  ema_decay: 0.999
+  phase: pre-ptqr
+
 gates:                        # PTQR battery + harness calibration
   top1_mismatch_vs_unquantized: equal
   acceptance_delta_pt: 1.0    # within +/- 1pt at TP4/C12 greedy bench
