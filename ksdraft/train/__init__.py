@@ -227,8 +227,20 @@ class Trainer:
     def load(self, path, map_location=None):
         ckpt = torch.load(path, map_location=map_location or self.device,
                           weights_only=False)
-        self.model.load_state_dict(ckpt["model"])
-        self.opt.load_state_dict(ckpt["optimizer"])
+        # New surfaces (e.g. the parallel block head) start fresh when an
+        # older checkpoint predates them; everything else must match.
+        missing, _unexpected = self.model.load_state_dict(
+            ckpt["model"], strict=False)
+        if missing:
+            print(f"[load] {len(missing)} new parameter(s) initialized fresh: "
+                  f"{missing[:3]}", flush=True)
+        try:
+            self.opt.load_state_dict(ckpt["optimizer"])
+        except ValueError:
+            # A new parameter (block head) changes the optimizer's group
+            # layout; the backbone weights still resume, Adam state restarts.
+            print("[load] optimizer state incompatible with the current "
+                  "parameter set; starting optimizer state fresh", flush=True)
         return ckpt
 
     # ---------- stages 4-7 (Section 11) ----------
