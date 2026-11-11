@@ -114,6 +114,7 @@ def main() -> int:
     ids = torch.zeros(len(windows), T, args.topk, dtype=torch.int64)
     probs = torch.zeros(len(windows), T, args.topk, dtype=torch.float16)
     done = 0
+    filled = 0
     t0 = time.time()
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -136,18 +137,21 @@ def main() -> int:
                 ids[i, t, :len(ci)] = ci
                 probs[i, t, :len(cp)] = cp
             done += 1
+            if any(ids[i, t, 0] != 0 for t in range(T)):
+                filled += 1
             if done % (args.save_every // 4) == 0:
                 rate = done / max(1e-9, time.time() - t0)
                 print(f"[mine] {done}/{len(windows)} ({rate:.1f}/s)",
                       flush=True)
             if done % args.save_every == 0:
                 torch.save({"windows": windows, "topk_ids": ids,
-                            "topk_probs": probs, "seq_len": T,
+                            "topk_probs": probs, "filled": filled,
+                            "seq_len": T,
                             "topk": args.topk,
                             "serve": {"top_p": args.top_p,
                                       "top_k": args.top_k}}, out_path)
     torch.save({"windows": windows, "topk_ids": ids, "topk_probs": probs,
-                "seq_len": T, "topk": args.topk,
+                "filled": filled, "seq_len": T, "topk": args.topk,
                 "serve": {"top_p": args.top_p, "top_k": args.top_k}},
                out_path)
     print(f"wrote {out_path} ({len(windows)} windows)")
