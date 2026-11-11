@@ -100,6 +100,7 @@ class KSDraftConfig:
             "rosa_streams": self.rosa_streams,
             "rosa_bits": self.rosa_bits,
             "ks3_charts": self.charts,
+            "block_len": self.block_len,
             "dtype": self.dtype,
             "tie_word_embeddings": self.tie_word_embeddings,
             "rosa_params_per_layer": self.rosa_params(),

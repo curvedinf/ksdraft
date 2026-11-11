@@ -63,6 +63,7 @@ def load_export(out_dir: str, device: str = "cpu") -> KSDraftModel:
         vocab_size=s["vocab_size"], layers=s["layers"], d_model=s["d_model"],
         head_size=s["head_size"], rosa_streams=s["rosa_streams"],
         rosa_bits=s["rosa_bits"], ks3_charts=s["ks3_charts"],
+        block_len=s.get("block_len", 16),
         dtype=s["dtype"], tie_word_embeddings=True,
     )
     model = KSDraftModel(cfg, teacher_dim=meta.get("teacher_dim", 0))
@@ -74,5 +75,10 @@ def load_export(out_dir: str, device: str = "cpu") -> KSDraftModel:
             sd["head.weight"] = sd["embedding.weight"]  # restore the tie
     else:
         sd = torch.load(out / "ksdraft.pt", map_location=device)
-    model.load_state_dict(sd)
+    # Exports made before the parallel block head (or other new surfaces)
+    # load with those parameters freshly initialized.
+    missing, _ = model.load_state_dict(sd, strict=False)
+    if missing:
+        print(f"[load_export] {len(missing)} new parameter(s) fresh: "
+              f"{missing[:3]}")
     return model.to(device)
