@@ -648,6 +648,12 @@ supervision is available on demand, (c) training is **native INT8 end-to-end**
   min(m,n)^2 * max(m,n) and would exceed the rest of the step.
 - **Numerics:** fully INT8 forward/backward, FP16 gradient handoff; rounding dither
   ON (PTQR exploration phase — early training explores neighboring grid points).
+- **Trunk kernels (2026-11-11):** the KS3 rank-1 geometry chain and the Rosa
+  hard-match core run as fused Triton forward/backward kernels
+  (`kernels/ks3_geom.py`, `kernels/rosa_match.py`). Measured at B=32: trunk
+  forward 150 -> 59 ms, full fwd+bwd+opt 469 -> 331 ms. Combined with the
+  frozen target embedding the recipe reaches 3201 tok/s at B=256 (677 ms/step
+  at B=96).
 - **Data alignment:** windows are sampled inside a single document
   (`WindowSampler(..., boundaries=...)`, `detect_boundaries`), never across a
   role/document boundary.

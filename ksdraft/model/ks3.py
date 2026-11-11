@@ -102,6 +102,13 @@ class KS3(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         coordinates = self.down(x)
+        if self.subspace_rank == 1:
+            from ..kernels.ks3_geom import ks3_geometry, triton_enabled
+            if triton_enabled(coordinates):
+                features = ks3_geometry(
+                    coordinates, self.coefficients, self.raw_scale,
+                    self.raw_shift)
+                return self.up(features.to(self.up.weight.dtype))
         geometry_dtype = (
             torch.float64 if coordinates.dtype == torch.float64 else torch.float32)
         h = coordinates.to(geometry_dtype).clamp(-65504.0, 65504.0)

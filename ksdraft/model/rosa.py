@@ -165,6 +165,12 @@ class RosaMixer(nn.Module):
                     hard = rosa_credit_forward(q_full, k_full, v_full, self.payload)
                     return self.out_proj(hard.to(x.dtype))
             # STE: exact hard forward, identity gradient on the projections.
+            # The fused kernel returns payload*sign with the STE/payload
+            # backward directly (no dense match tensors, no additive trick).
+            from ..kernels.rosa_match import fused_enabled, rosa_match
+            if fused_enabled(q_full):
+                hard = rosa_match(q_full, k_full, v_full, self.payload)
+                return self.out_proj(hard.to(x.dtype))
             # Adding (x - x.detach()) leaves the value unchanged (numerically
             # zero) while giving the projections/time mixes a gradient.
             with torch.no_grad():
@@ -178,10 +184,15 @@ class RosaMixer(nn.Module):
                         + (v_full - v_full.detach())
             return self.out_proj(hard.to(x.dtype))
         q_full = k_full = v_full = None
+        from ..kernels.rosa_match import fused_enabled, rosa_match
+        qf, kf, vf = self.q_proj(q_in), self.k_proj(k_in), self.v_proj(v_in)
+        if fused_enabled(qf):
+            hard = rosa_match(qf, kf, vf, self.payload)
+            return self.out_proj(hard.to(x.dtype))
         with torch.no_grad():
-            qbits = (self.q_proj(q_in) > 0).to(torch.int8)   # (B, T, S)
-            kbits = (self.k_proj(k_in) > 0).to(torch.int8)
-            vbits = (self.v_proj(v_in) > 0).to(torch.int8)
+            qbits = (qf > 0).to(torch.int8)   # (B, T, S)
+            kbits = (kf > 0).to(torch.int8)
+            vbits = (vf > 0).to(torch.int8)
 
             # per-stream match over (B, S) leading dims
             sign = _match_payload_sign_scan(
