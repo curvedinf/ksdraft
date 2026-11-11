@@ -35,11 +35,16 @@ def main() -> int:
     ap.add_argument("--wtv", type=float, default=0.5)
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--train-dtype", default="fp16",
+                    choices=["fp16", "bf16", "fp32"])
+    ap.add_argument("--embedding-init", default=None)
+    ap.add_argument("--freeze-embeddings", action="store_true")
+    ap.add_argument("--chunk", type=int, default=512)
     args = ap.parse_args()
 
     from ksdraft.cli import _load_target_config
     from ksdraft.model import KSDraftModel
-    from ksdraft.train import distillation_losses
+    from ksdraft.train import transfer_alignment
 
     cache = torch.load(args.cache, map_location="cpu", weights_only=False)
     windows = cache["windows"].long()
@@ -51,16 +56,22 @@ def main() -> int:
     cfg, _tspec, trspec = _load_target_config(args.config)
     dev = torch.device(args.device)
     torch.manual_seed(0)
-    model = KSDraftModel(cfg, teacher_dim=0).to(dev).train()
+    emb = (torch.load(args.embedding_init, map_location="cpu",
+                      weights_only=True) if args.embedding_init else None)
+    model = KSDraftModel(cfg, teacher_dim=0, embedding_init=emb).to(dev).train()
+    if args.freeze_embeddings:
+        model.embedding.weight.requires_grad_(False)
+        print("[distill] embedding/head frozen", flush=True)
     if args.init:
         ck = torch.load(args.init, map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model"])
         print(f"[distill] init from {args.init} (step {ck.get('step')})")
+    params = [p for p in model.parameters() if p.requires_grad]
     try:
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
+        opt = torch.optim.AdamW(params, lr=args.lr,
                                 weight_decay=0.01, fused=True)
     except (RuntimeError, TypeError):
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
+        opt = torch.optim.AdamW(params, lr=args.lr,
                                 weight_decay=0.01)
     g = torch.Generator().manual_seed(11)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
@@ -77,10 +88,26 @@ def main() -> int:
         w = windows[sel].to(dev)
         ids = topk_ids[sel].to(dev)
         probs = topk_probs[sel].to(dev)
-        logits, feats = model(w[:, :-1])
-        loss, parts = distillation_losses(
-            logits, w, feats, model.embedding.weight, probs, ids,
-            args.transfer, args.kl, args.wtv)
+        from ksdraft.kernels.fused_train import (linear_ce, linear_soft_ce,
+                                                 wtv_from_logp)
+        amp = (torch.autocast("cuda", dtype=torch.float16)
+               if args.device != "cpu" and args.train_dtype == "fp16"
+               else torch.autocast("cuda", enabled=False))
+        with amp:
+            h, feats = model.trunk(w[:, :-1])
+        d = h.shape[-1]
+        weight = model.head.weight
+        k = ids.shape[-1]
+        ce, _ = linear_ce(h.reshape(-1, d), weight, w[:, 1:].reshape(-1),
+                          None, args.chunk)
+        kl, logp = linear_soft_ce(h.reshape(-1, d), weight,
+                                  ids.reshape(-1, k), probs.reshape(-1, k),
+                                  None, args.chunk)
+        wtv = wtv_from_logp(logp, probs.reshape(-1, k))
+        ts = transfer_alignment(feats, model.embedding.weight, w[:, 1:])
+        loss = ce + args.transfer * ts + args.kl * kl + args.wtv * wtv
+        parts = {"ce": float(ce.detach()), "transfer": float(ts.detach()),
+                 "kl": float(kl.detach()), "wtv": float(wtv.detach())}
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
