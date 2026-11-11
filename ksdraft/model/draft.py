@@ -37,6 +37,12 @@ class KSDraftModel(nn.Module):
             [DraftBlock(cfg, layer) for layer in range(cfg.layers)])
         self.output_norm = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        # Parallel block drafting: N learned offsets on the output residual,
+        # one tied-head projection per offset. One trunk forward then yields
+        # N future-token distributions from the anchor position (Medusa-style
+        # head; the alternative is N autoregressive forwards).
+        self.block_delta = nn.Parameter(
+            torch.zeros(cfg.block_len, cfg.d_model))
 
         if teacher_dim:
             self.teacher_proj = nn.Linear(teacher_dim, cfg.d_model, bias=False)
@@ -55,16 +61,10 @@ class KSDraftModel(nn.Module):
             if self.teacher_proj is not None:
                 nn.init.zeros_(self.teacher_proj.weight)
 
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        teacher_states: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """tokens (B, T) -> (logits (B, T, V), per-layer transfer features).
-
-        teacher_states: (B, T, teacher_dim) fused multi-layer target hidden
-        states (already flattened across taps) for dual-source conditioning.
-        """
+    def trunk(self, tokens: torch.Tensor,
+              teacher_states: torch.Tensor | None = None
+              ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Hidden states after the output norm, plus per-layer features."""
         x = self.input_norm(self.embedding(tokens))
         if teacher_states is not None:
             if self.teacher_proj is None:
@@ -79,7 +79,29 @@ class KSDraftModel(nn.Module):
             x, feature = block(x, prev_feature)
             prev_feature = feature
             features.append(feature)
-        return self.head(self.output_norm(x)), features
+        return self.output_norm(x), features
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        teacher_states: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """tokens (B, T) -> (logits (B, T, V), per-layer transfer features)."""
+        h, features = self.trunk(tokens, teacher_states)
+        return self.head(h), features
+
+    def block_logits(self, tokens: torch.Tensor, n: int,
+                     teacher_states: torch.Tensor | None = None
+                     ) -> torch.Tensor:
+        """One forward -> logits for the next ``n`` tokens after the anchor.
+
+        Returns (B, n, V): offset k is the distribution for token anchor+k+1.
+        Uses the last input position's hidden state plus the learned offset.
+        """
+        h, _ = self.trunk(tokens, teacher_states)
+        anchor = h[:, -1]
+        hs = anchor.unsqueeze(1) + self.block_delta[:n].unsqueeze(0)
+        return hs @ self.head.weight.t()
 
     def param_counts(self) -> dict:
         core = self.config.layers * self.config.layer_params() + self.config.embedding_params()

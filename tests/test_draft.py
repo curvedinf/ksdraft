@@ -88,7 +88,7 @@ def test_bf16_forward():
 
 def test_full_shape_param_budget():
     """Decided shape on the meta device: core 964,153,248 + injection/LN extras
-    = 978,138,016 total (RWKV-8-only backbone, ~1B envelope)."""
+    + the parallel block head offsets = 978,162,592 total."""
     cfg = KSDraftConfig()
     model = KSDraftModel(cfg, device="meta", skip_init=True)
     counts = model.param_counts()
@@ -96,5 +96,7 @@ def test_full_shape_param_budget():
     d = cfg.d_model
     injection_per_layer = (2 * 64 + 6 * 32) * d + d
     ln_params = cfg.layers * 2 * 2 * d + 2 * 2 * d  # 2 norms/block + in/out
-    assert counts["extras"] == cfg.layers * injection_per_layer + ln_params
-    assert counts["total"] == 978_138_016
+    block_head = cfg.block_len * d
+    assert counts["extras"] == (cfg.layers * injection_per_layer + ln_params
+                                + block_head)
+    assert counts["total"] == 978_138_016 + block_head

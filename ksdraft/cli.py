@@ -55,6 +55,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--corpus-size", type=int, default=200_000)
     p_train.add_argument("--resume", default=None, help="checkpoint path")
     p_train.add_argument("--out", default="runs/train")
+    p_train.add_argument("--block-n", type=int, default=0,
+                         help="parallel block-draft offsets to supervise")
     p_train.add_argument("--save-every", type=int, default=None,
                          help="checkpoint interval in steps (default: steps/10)")
 
@@ -188,6 +190,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
         batch_size=args.batch_size or 4,
         peak_lr=float((trspec.get("optimizer") or {}).get("peak_lr", 3e-4)),
         val_every=args.save_every or max(1, (args.steps or 50) // 10),
+        block_n=args.block_n,
     )
     trainer = Trainer(model, teacher, sampler, tcfg, device=args.device,
                       out_dir=args.out)
@@ -208,10 +211,19 @@ def _load_model(args) -> "object":
     cfg, tspec, _ = _load_target_config(args.config)
     n_taps = len((tspec.get("state_taps") or [6, 14, 22, 30, 38, 48]))
     d_tap = int(tspec.get("fixture_d_tap", 64))
-    model = KSDraftModel(cfg, teacher_dim=n_taps * d_tap)
+    state = None
     if getattr(args, "checkpoint", None):
         sd = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        model.load_state_dict(sd["model"] if "model" in sd else sd)
+        state = sd["model"] if "model" in sd else sd
+    # Teacher conditioning is a property of the checkpoint, not the recipe:
+    # drafts trained with logits-only teachers have no teacher_proj.
+    teacher_dim = (n_taps * d_tap
+                   if state is not None
+                   and any(k.startswith("teacher_proj") for k in state)
+                   else 0)
+    model = KSDraftModel(cfg, teacher_dim=teacher_dim)
+    if state is not None:
+        model.load_state_dict(state)
     return model
 
 

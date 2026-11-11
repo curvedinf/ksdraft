@@ -43,6 +43,10 @@ class TrainConfig:
     # Temp-1.0 objective: window total variation on the teacher's top-k
     # support (the served sampler's operative distribution match).
     wtv_weight: float = 0.5
+    # Parallel block drafting: supervise N future tokens from the anchor in
+    # one forward (the serving proposal path; 0 disables the block head).
+    block_n: int = 0
+    block_weight: float = 1.0
     val_every: int = 50
     seed: int = 11
 
@@ -59,10 +63,11 @@ class WindowSampler:
         self.seq_len = seq_len
         self.g = torch.Generator().manual_seed(seed)
 
-    def batch(self, batch_size: int) -> torch.Tensor:
-        idx = torch.randint(0, len(self.ids) - self.seq_len - 1, (batch_size,),
+    def batch(self, batch_size: int, extra: int = 0) -> torch.Tensor:
+        span = self.seq_len + 1 + extra
+        idx = torch.randint(0, len(self.ids) - span, (batch_size,),
                             generator=self.g)
-        ar = torch.arange(self.seq_len + 1)
+        ar = torch.arange(span)
         return self.ids[idx[:, None] + ar[None, :]]
 
 
@@ -163,7 +168,9 @@ class Trainer:
         history = []
         for step in range(self.cfg.steps):
             self._apply_lr(step)
-            batch = self.sampler.batch(self.cfg.batch_size).to(self.device)
+            bn = int(self.cfg.block_n)
+            batch = self.sampler.batch(
+                self.cfg.batch_size, extra=max(0, bn - 1)).to(self.device)
             tokens = batch  # (B, T+1); inputs batch[:, :-1], targets batch[:, 1:]
             states = None
             tp = ti = None
@@ -180,6 +187,14 @@ class Trainer:
                 self.cfg.transfer_weight,
                 self.cfg.kl_weight if use_teacher else 0.0,
                 self.cfg.wtv_weight if use_teacher else 0.0)
+            if bn > 0:
+                ctx = tokens[:, :self.cfg.seq_len]
+                tgt = tokens[:, self.cfg.seq_len:self.cfg.seq_len + bn]
+                blog = model.block_logits(ctx, bn)
+                block_ce = F.cross_entropy(
+                    blog.flatten(0, 1).float(), tgt.flatten())
+                loss = loss + self.cfg.block_weight * block_ce
+                parts["block_ce"] = float(block_ce.detach())
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.grad_clip)
@@ -187,8 +202,11 @@ class Trainer:
             rec = {"step": step, "loss": loss.item(), "grad_norm": float(gn), **parts}
             history.append(rec)
             if step % max(1, self.cfg.steps // 10) == 0 or step == self.cfg.steps - 1:
+                extra = (f" bce {parts['block_ce']:.4f}"
+                         if "block_ce" in parts else "")
                 log(f"[{stage} {step:4d}] loss {rec['loss']:.4f} "
-                    f"ce {rec['ce']:.4f} ts {rec['transfer']:.4f} gn {rec['grad_norm']:.2f}")
+                    f"ce {rec['ce']:.4f} ts {rec['transfer']:.4f}{extra} "
+                    f"gn {rec['grad_norm']:.2f}")
             if self.out_dir and ((step + 1) % self.cfg.val_every == 0
                                  or step == self.cfg.steps - 1):
                 self.save(step)
