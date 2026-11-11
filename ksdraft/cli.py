@@ -55,6 +55,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--corpus-size", type=int, default=200_000)
     p_train.add_argument("--resume", default=None, help="checkpoint path")
     p_train.add_argument("--out", default="runs/train")
+    p_train.add_argument("--save-every", type=int, default=None,
+                         help="checkpoint interval in steps (default: steps/10)")
 
     p_gate = sub.add_parser("gate", help="run the dtype-tier parity battery")
     p_gate.add_argument("--config", default="configs/flint.yaml")
@@ -159,6 +161,12 @@ def _cmd_train(args: argparse.Namespace) -> int:
     cfg, tspec, trspec = _load_target_config(args.config)
     if args.corpus == "synthetic":
         ids = synthetic_ids(args.corpus_size, cfg.vocab_size)
+    elif str(args.corpus).endswith(".pt"):
+        # Pre-tokenized token stream (e.g. the PTQR 512k corpus): keep it as a
+        # tensor so multi-million-token corpora do not become Python lists.
+        ids = torch.load(args.corpus, map_location="cpu", weights_only=True)
+        if isinstance(ids, dict):
+            ids = ids.get("tokens", ids.get("ids"))
     else:
         ids = json.loads(Path(args.corpus).read_text())
     sampler = WindowSampler(ids, seq_len=args.seq_len or 64, seed=11)
@@ -179,6 +187,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
         seq_len=args.seq_len or 64,
         batch_size=args.batch_size or 4,
         peak_lr=float((trspec.get("optimizer") or {}).get("peak_lr", 3e-4)),
+        val_every=args.save_every or max(1, (args.steps or 50) // 10),
     )
     trainer = Trainer(model, teacher, sampler, tcfg, device=args.device,
                       out_dir=args.out)
