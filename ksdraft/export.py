@@ -21,13 +21,21 @@ from .model import KSDraftModel
 def export_model(model: KSDraftModel, out_dir: str) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    c = model.config
     meta = {
         "format": "ksdraft-v1",
         "package_version": __version__,
+        # HF-style top-level fields: the serving engine's ModelConfig parses
+        # these directly (draft_model_config for the ksdraft speculator).
         "model_type": "ksdraft",
-        "dtype_tiers": ["int8", "bf16", "fp32"],
         "architectures": ["KSDraftModelForCausalLM"],
-        "config": model.config.summary(),
+        "hidden_size": c.d_model,
+        "num_hidden_layers": c.layers,
+        "vocab_size": c.vocab_size,
+        "torch_dtype": "float32",
+        "max_position_embeddings": 4096,
+        "dtype_tiers": ["int8", "bf16", "fp32"],
+        "config": c.summary(),
     }
     if getattr(model, "teacher_dim", 0):
         meta["teacher_dim"] = model.teacher_dim
