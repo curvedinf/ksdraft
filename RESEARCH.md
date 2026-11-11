@@ -639,7 +639,9 @@ supervision is available on demand, (c) training is **native INT8 end-to-end**
 - **Optimization (2026-11-11 update):** fused AdamW by default, with an
   optional split Muon run (torch 2.11 built-in) for the dense 2D hidden maps;
   embeddings, norms, biases and the structured tables (payloads, coefficients,
-  dtables) stay on AdamW. Cosine or warmup-stable-decay (WSD) schedule, peak
+  dtables) stay on AdamW. A 400-step B=64 A/B (random init) measured Muon
+  1e-3 improving next-token CE 8.08 -> 7.89 but worsening block CE
+  8.12 -> 8.22 (+12% step time); Muon 4e-3 was neutral. It stays opt-in. Cosine or warmup-stable-decay (WSD) schedule, peak
   ~1e-4–3e-4, warmup, grad-norm clip 1.0, gradient accumulation for effective
   batches above the ~96-sample activation limit. Tail EMA is written as
   `ckpt_ema.pt`. The KS3 5888-wide maps stay on AdamW: Newton–Schulz cost is
@@ -653,8 +655,9 @@ supervision is available on demand, (c) training is **native INT8 end-to-end**
   projection (`scripts/init_embedding.py`, Gram correlation 0.999) and can be
   frozen (`--freeze-embeddings`), the EAGLE-3.x / AMD Quark recipe; that removes
   230M trainable parameters and the dominant head weight-gradient traffic.
-- **Block objective:** per-offset weights (`block_position_decay`, EAGLE-4
-  0.8^i shape) instead of uniform offsets; teacher KL + WTV run on the same
+- **Block objective:** optional per-offset weights (`block_position_decay`,
+  EAGLE-4 0.8^i shape; neutral in the 400-step A/B, so uniform is the
+  default); teacher KL + WTV run on the same
   chunked head (`linear_soft_ce`, `wtv_from_logp`), no full-vocab logits.
 
 ### Stage 3 — Corrector stage (conditional; DCOCO fallback path)
