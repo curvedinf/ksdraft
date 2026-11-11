@@ -40,6 +40,9 @@ class TrainConfig:
     weight_decay: float = 0.01
     transfer_weight: float = 0.5
     kl_weight: float = 0.2
+    # Temp-1.0 objective: window total variation on the teacher's top-k
+    # support (the served sampler's operative distribution match).
+    wtv_weight: float = 0.5
     val_every: int = 50
     seed: int = 11
 
@@ -72,6 +75,7 @@ def distillation_losses(
     teacher_topk_ids: torch.Tensor | None = None,
     transfer_weight: float = 0.5,
     kl_weight: float = 0.2,
+    wtv_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     inp, tgt = tokens[:, :-1], tokens[:, 1:]
     # logits/teacher signals cover exactly the inp positions (T of them)
@@ -96,6 +100,12 @@ def distillation_losses(
         kl = -(p_t * model_top).sum(-1).mean()  # cross-entropy on teacher support
         loss = loss + kl_weight * kl
         parts["kl"] = float(kl)
+        if wtv_weight > 0:
+            from .stages import wtv_loss
+
+            wtv = wtv_loss(logits, teacher_probs, teacher_topk_ids)
+            loss = loss + wtv_weight * wtv
+            parts["wtv"] = float(wtv)
 
     return loss, parts
 
@@ -168,7 +178,8 @@ class Trainer:
                 logits, tokens, features,
                 model.embedding.weight, tp, ti,
                 self.cfg.transfer_weight,
-                self.cfg.kl_weight if use_teacher else 0.0)
+                self.cfg.kl_weight if use_teacher else 0.0,
+                self.cfg.wtv_weight if use_teacher else 0.0)
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.grad_clip)
