@@ -30,20 +30,35 @@ def latest_shard(root: Path) -> Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--shards", required=True)
+    ap.add_argument("--shards", required=True, action="append",
+                    help="shard directory (newest shard) or .pt file; repeat "
+                         "to merge tiers")
     ap.add_argument("--out", required=True)
     ap.add_argument("--val-frac", type=float, default=0.01)
     ap.add_argument("--tokenizer", default=None,
                     help="optional: verify every boundary is a chat turn")
     args = ap.parse_args()
 
-    src = Path(args.shards)
-    shard = latest_shard(src)
-    data = torch.load(shard, map_location="cpu", weights_only=True)
-    tokens = data["tokens"].long()
-    bounds = data["boundaries"].long()
-    meta = data.get("meta") or []
-    print(f"{shard.name}: {tokens.numel()} tokens, {bounds.numel()} docs",
+    parts = []
+    for raw in args.shards:
+        p = Path(raw)
+        shard = latest_shard(p) if p.is_dir() else p
+        data = torch.load(shard, map_location="cpu", weights_only=True)
+        parts.append((shard, data))
+    token_parts, bound_parts, meta = [], [], []
+    offset = 0
+    for shard, data in parts:
+        t = data["tokens"].long()
+        b = data["boundaries"].long()
+        print(f"{shard.name}: {t.numel()} tokens, {b.numel()} docs",
+              flush=True)
+        token_parts.append(t)
+        bound_parts.append(b + offset)
+        meta.extend(data.get("meta") or [])
+        offset += t.numel()
+    tokens = torch.cat(token_parts)
+    bounds = torch.cat(bound_parts)
+    print(f"merged: {tokens.numel()} tokens, {bounds.numel()} docs",
           flush=True)
 
     if bounds.numel() and int(bounds[0]) != 0:
@@ -79,7 +94,8 @@ def main() -> int:
            "boundaries": bounds[cut_doc:].clone() - cut}
     torch.save(train, out / "train_tokens.pt")
     torch.save(val, out / "val_tokens.pt")
-    summary = {"source": str(shard), "tokens": int(tokens.numel()),
+    summary = {"sources": [str(p[0]) for p in parts],
+               "tokens": int(tokens.numel()),
                "docs": n_docs, "train_tokens": int(train["tokens"].numel()),
                "val_tokens": int(val["tokens"].numel()),
                "train_docs": int(train["boundaries"].numel()),
