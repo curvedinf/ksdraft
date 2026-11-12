@@ -38,6 +38,8 @@ def main() -> int:
     ap.add_argument("--train-dtype", default="fp16",
                     choices=["fp16", "bf16", "fp32"])
     ap.add_argument("--embedding-init", default=None)
+    ap.add_argument("--transfer-space", default=None)
+    ap.add_argument("--transfer-init", action="store_true")
     ap.add_argument("--freeze-embeddings", action="store_true")
     ap.add_argument("--chunk", type=int, default=512)
     ap.add_argument("--block-n", type=int, default=4)
@@ -51,6 +53,8 @@ def main() -> int:
     ap.add_argument("--selector-weight", type=float, default=1.0,
                     help="DFlash2 pairwise path-selector CE weight")
     ap.add_argument("--selector-topk", type=int, default=16)
+    ap.add_argument("--transfer-gamma", type=float, default=2.0)
+    ap.add_argument("--spine-sub-prob", type=float, default=0.1)
     args = ap.parse_args()
 
     from ksdraft.cli import _load_target_config
@@ -78,7 +82,12 @@ def main() -> int:
     torch.manual_seed(0)
     emb = (torch.load(args.embedding_init, map_location="cpu",
                       weights_only=True) if args.embedding_init else None)
-    model = KSDraftModel(cfg, teacher_dim=0, embedding_init=emb).to(dev).train()
+    ts_space = None
+    if args.transfer_space:
+        ts_space = torch.load(args.transfer_space, map_location="cpu",
+                              weights_only=True)
+    model = KSDraftModel(cfg, teacher_dim=0, embedding_init=emb,
+                         transfer_space=ts_space).to(dev).train()
     if args.freeze_embeddings:
         model.embedding.weight.requires_grad_(False)
         print("[distill] embedding/head frozen", flush=True)
@@ -117,7 +126,9 @@ def main() -> int:
                if args.device != "cpu" and args.train_dtype == "fp16"
                else torch.autocast("cuda", enabled=False))
         with amp:
-            h, feats = model.trunk(w[:, :-1])
+            sub_p = args.spine_sub_prob * max(
+                0.0, 1.0 - step / max(1.0, 0.5 * args.steps))
+            h, feats = model.trunk(w[:, :-1], sub_prob=sub_p)
         d = h.shape[-1]
         weight = model.head.weight
         k = ids.shape[-1]
@@ -127,7 +138,8 @@ def main() -> int:
                                   ids.reshape(-1, k), probs.reshape(-1, k),
                                   None, args.chunk)
         wtv = wtv_from_logp(logp, probs.reshape(-1, k))
-        ts = transfer_alignment(feats, model.embedding.weight, w[:, 1:])
+        ts = transfer_alignment(feats, model.transfer_C, w[:, 1:],
+                                args.transfer_gamma)
         loss = ce + args.transfer * ts + args.kl * kl + args.wtv * wtv
         parts = {"ce": float(ce.detach()), "transfer": float(ts.detach()),
                  "kl": float(kl.detach()), "wtv": float(wtv.detach())}

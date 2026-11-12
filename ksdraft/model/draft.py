@@ -23,12 +23,14 @@ from ..config import KSDraftConfig
 from .block import DraftBlock
 from .blockconv import BlockConv
 from .selector import BlockSelector
+from .spine import SpineCore
 
 
 class KSDraftModel(nn.Module):
     def __init__(self, config: KSDraftConfig | None = None, teacher_dim: int = 0,
                  device: torch.device | str | None = None, skip_init: bool = False,
-                 embedding_init: torch.Tensor | None = None):
+                 embedding_init: torch.Tensor | None = None,
+                 transfer_space: dict | None = None):
         super().__init__()
         cfg = config or KSDraftConfig()
         self.config = cfg
@@ -36,8 +38,27 @@ class KSDraftModel(nn.Module):
 
         self.embedding = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.input_norm = nn.LayerNorm(cfg.d_model)
+
+        # DSpine unified transfer space (fixed whitened PCA of the target LM
+        # head). Without a file, fall back to unit-norm embedding rows at the
+        # model width so tests/dev boxes stay constructible.
+        if transfer_space is not None:
+            C = transfer_space.get("C")
+            R_init = transfer_space.get("R_init")
+            rank = int(transfer_space.get(
+                "rank", C.shape[-1] if C is not None else cfg.d_model))
+            C = (C.float() if C is not None
+                 else torch.zeros(cfg.vocab_size, rank))
+        else:
+            C = torch.nn.functional.normalize(
+                self.embedding.weight.detach().float(), dim=-1)
+            R_init = None
+            rank = cfg.d_model
+        self.register_buffer("transfer_C", C, persistent=False)
+        self.spine_core = SpineCore(rank)
         self.blocks = nn.ModuleList(
-            [DraftBlock(cfg, layer) for layer in range(cfg.layers)])
+            [DraftBlock(cfg, layer, self.spine_core, rank, C, R_init)
+             for layer in range(cfg.layers)])
         self.output_norm = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         # Parallel block drafting: N learned offsets on the output residual,
@@ -74,9 +95,14 @@ class KSDraftModel(nn.Module):
                     self.embedding.weight.dtype))
 
     def trunk(self, tokens: torch.Tensor,
-              teacher_states: torch.Tensor | None = None
+              teacher_states: torch.Tensor | None = None,
+              sub_prob: float = 0.0
               ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Hidden states after the output norm, plus per-layer features."""
+        """Hidden states after the output norm, plus per-layer readouts.
+
+        Teacher-forced predecessor tokens feed the optional DSpine
+        substitution (paper 4.5); position 0 has no in-block predecessor.
+        """
         x = self.input_norm(self.embedding(tokens))
         if teacher_states is not None:
             if self.teacher_proj is None:
@@ -85,11 +111,11 @@ class KSDraftModel(nn.Module):
             x = x + self.teacher_proj(
                 teacher_states.to(self.teacher_proj.weight.dtype))
 
-        prev_feature = None
+        prev_tokens = torch.zeros_like(tokens)
+        prev_tokens[:, 1:] = tokens[:, :-1]
         features = []
         for block in self.blocks:
-            x, feature = block(x, prev_feature)
-            prev_feature = feature
+            x, feature = block(x, prev_tokens, sub_prob)
             features.append(feature)
         return self.output_norm(x), features
 
@@ -103,7 +129,8 @@ class KSDraftModel(nn.Module):
         return self.head(h), features
 
     def forward_block_hidden(self, tokens: torch.Tensor, n: int,
-                             teacher_states: torch.Tensor | None = None
+                             teacher_states: torch.Tensor | None = None,
+                             sub_prob: float = 0.0
                              ) -> tuple[torch.Tensor, list[torch.Tensor],
                                         torch.Tensor]:
         """Trunk pass returning (hidden, features, block hidden states).
@@ -111,7 +138,7 @@ class KSDraftModel(nn.Module):
         Training projects these through the chunked head losses so the full
         vocab logits are never materialized (see kernels/fused_train.py).
         """
-        h, features = self.trunk(tokens, teacher_states)
+        h, features = self.trunk(tokens, teacher_states, sub_prob)
         anchor = h[:, -1]
         hs = self.block_conv(anchor.unsqueeze(1)
                              + self.block_delta[:n].unsqueeze(0))

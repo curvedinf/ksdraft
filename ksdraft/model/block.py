@@ -22,21 +22,27 @@ from .spine import AdjacentInjection
 
 
 class DraftBlock(nn.Module):
-    def __init__(self, config, layer: int):
+    def __init__(self, config, layer: int, spine_core, rank: int,
+                 transfer_C: torch.Tensor | None = None,
+                 R_init: torch.Tensor | None = None):
         super().__init__()
         d = config.d_model
         self.ln_attn = nn.LayerNorm(d)
         self.rosa = RosaMixer(d, config.rosa_streams, config.rosa_bits)
-        self.injection = AdjacentInjection(d)
+        self.injection = AdjacentInjection(d, rank, spine_core, transfer_C,
+                                           R_init)
         self.ln_ffn = nn.LayerNorm(d)
         self.ffn = KS3(d, config.ks3_charts or None)
 
     def forward(
         self,
         x: torch.Tensor,
-        prev_layer_feature: torch.Tensor | None = None,
+        prev_tokens: torch.Tensor | None = None,
+        sub_prob: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # DSpine injects after the layer update (paper: after every layer),
+        # so the FFN comes first and the message enters the post-layer state.
         h = x + self.rosa(self.ln_attn(x))
-        h, feature = self.injection(h, prev_layer_feature)
         y = h + self.ffn(self.ln_ffn(h))
+        y, feature = self.injection(y, prev_tokens, sub_prob)
         return y, feature

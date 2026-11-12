@@ -14,20 +14,28 @@ def _tiny(**kw):
 
 def test_fresh_block_is_identity():
     torch.manual_seed(0)
+    from ksdraft.model.spine import SpineCore
+
     cfg = _tiny()
-    block = DraftBlock(cfg, layer=0).eval()
+    core = SpineCore(cfg.d_model)
+    block = DraftBlock(cfg, 0, core, cfg.d_model).eval()
     x = torch.randn(2, 16, cfg.d_model)
-    y, feat = block(x, None)
+    y, feat = block(x, None, 0.0)
     assert torch.allclose(y, x, atol=1e-6)  # every additive update zero-init
+    assert feat.shape == x.shape
 
 
 def test_injection_shapes_and_position_shift():
-    inj = AdjacentInjection(64)
-    z = torch.randn(2, 10, 64)
-    z2, p = inj(z)
-    assert z2.shape == p.shape == z.shape
-    # feature head zero-init -> injection contributes nothing, z2 == z
-    assert torch.allclose(z2, z)
+    from ksdraft.model.spine import SpineCore
+
+    core = SpineCore(8)
+    inj = AdjacentInjection(64, 8, core)
+    u = torch.randn(2, 10, 64)
+    h, e = inj(u)
+    assert h.shape == u.shape
+    assert e.shape == (2, 10, 8)
+    # G_p / W zero-init -> the injection is the identity at init
+    assert torch.allclose(h, u)
 
 
 def test_model_forward_backward():
@@ -40,7 +48,9 @@ def test_model_forward_backward():
         for b in model.blocks:
             b.rosa.out_proj.weight.normal_(0, 0.02)
             b.ffn.up.weight.normal_(0, 0.02)
-            b.injection.inject.up.weight.normal_(0, 0.02)
+            b.injection.W.weight.normal_(0, 0.02)
+        model.spine_core.Gp.weight.normal_(0, 0.02)
+        model.spine_core.A.weight.normal_(0, 0.02)
     tokens = torch.randint(0, cfg.vocab_size, (2, 24))
     logits, features = model(tokens)
     assert logits.shape == (2, 24, cfg.vocab_size)
@@ -90,15 +100,23 @@ def test_full_shape_param_budget():
     """Decided shape on the meta device: core 964,153,248 + injection/LN extras
     + block-head offsets + the DFlash2-style intra-block conv."""
     cfg = KSDraftConfig()
-    model = KSDraftModel(cfg, device="meta", skip_init=True)
+    d0 = cfg.d_model
+    rank = 256
+    model = KSDraftModel(cfg, device="meta", skip_init=True,
+                         transfer_space={
+                             "C": torch.empty(cfg.vocab_size, rank,
+                                              device="meta"),
+                             "rank": rank})
     counts = model.param_counts()
     assert counts["core"] == cfg.total_params() == 964_153_248
     d = cfg.d_model
-    injection_per_layer = (2 * 64 + 6 * 32) * d + d
     ln_params = cfg.layers * 2 * 2 * d + 2 * 2 * d  # 2 norms/block + in/out
     block_head = cfg.block_len * d
     conv = 2 * d + 2 * d * d          # base taps + dynamic projection
     selector = 3 * d * 256            # predecessor/successor/context projections
-    assert counts["extras"] == (cfg.layers * injection_per_layer + ln_params
-                                + block_head + conv + selector)
-    assert counts["total"] == 978_138_016 + block_head + conv + selector
+    # DSpine injection: per-layer R + W (rank 256), shared A/Gq/Gp/b
+    spine_layer = 2 * 256 * d
+    spine_core = 3 * 256 * 256 + 256
+    assert counts["extras"] == (cfg.layers * spine_layer + spine_core
+                                + ln_params + block_head + conv + selector)
+    assert counts["total"] == counts["core"] + counts["extras"]

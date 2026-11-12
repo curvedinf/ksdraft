@@ -68,6 +68,13 @@ class TrainConfig:
     # top-K, teacher-forcing the predecessor. Zero-init pair term, so the
     # objective starts equal to the unary argmax.
     selector_weight: float = 1.0
+    # DSpine layer-wise embedding loss: cosine to the unified transfer space,
+    # position decay w_i = exp(-(i)/gamma) (paper Eq. 6).
+    transfer_gamma: float = 2.0
+    # Teacher-forced predecessor substitution probability (paper 4.5 phases
+    # it out); 0 disables.
+    spine_sub_prob: float = 0.1
+    transfer_space: str | None = None
     # Schedule: "cosine" (reference) or "wsd" (warmup-stable-decay, the
     # speedrun-proven shape for longer runs / late annealing).
     lr_schedule: str = "cosine"
@@ -270,6 +277,7 @@ class Trainer:
                                   c["topk_probs"][:n].float())
         self._t0 = time.time()
         self._last_roll = self._t0
+        self._step_sub_prob = 0.0
 
     def _lr_scale(self, step: int) -> float:
         c = self.cfg
@@ -325,6 +333,10 @@ class Trainer:
         accum = max(1, int(self.cfg.grad_accum))
         for step in range(self.cfg.steps):
             self._apply_lr(step)
+            # DSpine 4.5: teacher-forced predecessor substitution starts at
+            # spine_sub_prob and phases out over the first half of training.
+            self._step_sub_prob = self.cfg.spine_sub_prob * max(
+                0.0, 1.0 - step / max(1.0, 0.5 * self.cfg.steps))
             if block_only and step == block_only:
                 for prm in model.parameters():
                     prm.requires_grad_(True)
@@ -397,15 +409,16 @@ class Trainer:
             main_tokens = tokens[:, :self.cfg.seq_len + 1]
             with self._amp():
                 h, features, hs = model.forward_block_hidden(
-                    ctx, bn, teacher_states=states)
+                    ctx, bn, teacher_states=states,
+                    sub_prob=self._step_sub_prob)
             d = h.shape[-1]
             w = model.head.weight
             tgt = tokens[:, self.cfg.seq_len:self.cfg.seq_len + bn]
             ce, _ = linear_ce(h.reshape(-1, d), w,
                               main_tokens[:, 1:].reshape(-1),
                               None, self.cfg.head_chunk)
-            ts = transfer_alignment(features, model.embedding.weight,
-                                    main_tokens[:, 1:])
+            ts = transfer_alignment(features, model.transfer_C,
+                                    main_tokens[:, 1:], self.cfg.transfer_gamma)
             bw = block_position_weights(
                 bn, self.cfg.block_position_decay, h.device).repeat(h.shape[0])
             bce, _ = linear_ce(hs.reshape(-1, d), w, tgt.reshape(-1), bw,
@@ -614,6 +627,10 @@ class Trainer:
         history = []
         for step in range(self.cfg.steps):
             self._apply_lr(step)
+            # DSpine 4.5: teacher-forced predecessor substitution starts at
+            # spine_sub_prob and phases out over the first half of training.
+            self._step_sub_prob = self.cfg.spine_sub_prob * max(
+                0.0, 1.0 - step / max(1.0, 0.5 * self.cfg.steps))
             batch = self.sampler.batch(self.cfg.batch_size).to(self.device)
             T = batch.shape[1] - 1
             with torch.no_grad():
@@ -652,6 +669,10 @@ class Trainer:
         history = []
         for step in range(self.cfg.steps):
             self._apply_lr(step)
+            # DSpine 4.5: teacher-forced predecessor substitution starts at
+            # spine_sub_prob and phases out over the first half of training.
+            self._step_sub_prob = self.cfg.spine_sub_prob * max(
+                0.0, 1.0 - step / max(1.0, 0.5 * self.cfg.steps))
             batch = self.sampler.batch(self.cfg.batch_size).to(self.device)
             flat, tp, ti = self._teacher_batch(batch)
             logits, features = model(batch[:, :-1], teacher_states=flat)
@@ -820,15 +841,26 @@ def held_out_metrics(model, tensors, block_n: int = 0, seq_len: int = 16,
     return out
 
 
-def transfer_alignment(features: list[torch.Tensor], embedding_weight: torch.Tensor,
-                       targets: torch.Tensor) -> torch.Tensor:
-    """DSpine transfer-space loss: per-layer predicted feature vs the next
-    token's target embedding (cosine), averaged over layers."""
-    tgt_emb = F.normalize(embedding_weight[targets].float(), dim=-1)
+def transfer_alignment(features: list[torch.Tensor], C: torch.Tensor,
+                       targets: torch.Tensor,
+                       gamma: float = 2.0) -> torch.Tensor:
+    """DSpine Eq. 6: layer-wise cosine to the transfer space, decayed.
+
+    ``features`` are the post-injection readouts f_l(h_l,t) [B,T,r]; C is
+    the fixed [vocab,r] table. w_i = exp(-i/gamma) over window positions,
+    normalized by the weight sum, then averaged over layers.
+    """
+    tgt = C[targets].float()
+    tgt = F.normalize(tgt, dim=-1)
+    n = targets.shape[1]
+    w = torch.exp(-torch.arange(n, device=targets.device,
+                                dtype=torch.float32) / max(gamma, 1e-6))
+    w = w / w.sum().clamp_min(1e-9)
     ts = 0.0
     for f in features:
         fn = F.normalize(f.float(), dim=-1)
-        ts = ts + (1 - (fn * tgt_emb).sum(-1)).mean()
+        per_pos = (1 - (fn * tgt).sum(-1))            # [B,T]
+        ts = ts + (per_pos * w[None, :]).sum(-1).mean()
     return ts / max(1, len(features))
 
 

@@ -106,6 +106,23 @@ Researched 2026-11-08. No implementation has begun.
   - Model (Qwen3-8B-DCOCO drafter): https://huggingface.co/TD-Labs/Qwen3-8B-DCOCO
   - HF paper page: https://huggingface.co/papers/2610.12570
 
+### Implementation (2026-11-12, §2 audit)
+- DSpine now follows the paper equations: a fixed unified transfer space C =
+  normalize(Λ_r^-1/2 P_r^T (Ē_v - μ)) built from the target LM head
+  (`scripts/build_transfer_space.py`), readouts z = sqrt(r)·normalize(R_l u),
+  shared A/G_q/G_p/b with a per-layer W_l, post-layer injection, and the
+  layer-wise cosine loss with decay w_i = exp(-i/γ) (Eq. 6). R_l is
+  initialized with P_r^T V (embedding SVD basis, since our width is 1536 vs
+  the target's 2048). Teacher-forced predecessor substitution is implemented
+  and phased out over the first half of training.
+- Already covered: block-causal attention direction (Rosa is causal), the
+  DCOCO-style corrector (our DFlash2 selector: top-16 pair scores + greedy
+  walk).
+- Still open: last-write refinement / transition cache (predecessor-token
+  re-write at the head), and DSpine's Eq. 7 distillation mix (α·CE +
+  (1-α)·L1) — we currently use block forward KL + small CE + WTV. γ is not
+  published in the fetched text (Appendix A), so 2.0 is our default.
+
 ---
 
 ## 3. Adaptive scheduling (efficiency)

@@ -39,6 +39,8 @@ def export_model(model: KSDraftModel, out_dir: str,
         "dtype": dtype,
         "config": c.summary(),
     }
+    if getattr(model, "spine_core", None) is not None:
+        meta["transfer_rank"] = int(model.spine_core.rank)
     if getattr(model, "teacher_dim", 0):
         meta["teacher_dim"] = model.teacher_dim
     (out / "config.json").write_text(json.dumps(meta, indent=2))

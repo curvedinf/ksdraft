@@ -72,6 +72,10 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="DFlash2 pairwise path-selector CE weight")
     p_train.add_argument("--block-ce-weight", type=float, default=None,
                          help="hard block-CE auxiliary in the distill stage")
+    p_train.add_argument("--transfer-space", default=None,
+                         help="DSpine transfer-space .pt (C, R_init, rank)")
+    p_train.add_argument("--transfer-gamma", type=float, default=None)
+    p_train.add_argument("--spine-sub-prob", type=float, default=None)
     p_train.add_argument("--embedding-init", default=None,
                          help=".pt tensor [vocab, d_model] (target SVD projection)")
     p_train.add_argument("--freeze-embeddings", action="store_true",
@@ -229,7 +233,12 @@ def _cmd_train(args: argparse.Namespace) -> int:
     if args.embedding_init:
         emb_init = torch.load(args.embedding_init, map_location="cpu",
                               weights_only=True)
-    model = KSDraftModel(cfg, teacher_dim=teacher_dim, embedding_init=emb_init)
+    ts_space = None
+    if getattr(args, "transfer_space", None):
+        ts_space = torch.load(args.transfer_space, map_location="cpu",
+                              weights_only=True)
+    model = KSDraftModel(cfg, teacher_dim=teacher_dim, embedding_init=emb_init,
+                         transfer_space=ts_space)
     tcfg = TrainConfig(
         steps=args.steps or int(trspec.get("steps", 50)),
         seq_len=args.seq_len or 64,
@@ -273,6 +282,13 @@ def _cmd_train(args: argparse.Namespace) -> int:
                     else TrainConfig.eval_cache),
         eval_windows=(args.eval_windows if args.eval_windows is not None
                       else TrainConfig.eval_windows),
+        transfer_space=(args.transfer_space if args.transfer_space
+                        else TrainConfig.transfer_space),
+        transfer_gamma=(args.transfer_gamma if args.transfer_gamma is not None
+                        else TrainConfig.transfer_gamma),
+        spine_sub_prob=(args.spine_sub_prob
+                        if args.spine_sub_prob is not None
+                        else TrainConfig.spine_sub_prob),
     )
     trainer = Trainer(model, teacher, sampler, tcfg, device=args.device,
                       out_dir=args.out)
@@ -305,7 +321,11 @@ def _load_model(args) -> "object":
                    if state is not None
                    and any(k.startswith("teacher_proj") for k in state)
                    else 0)
-    model = KSDraftModel(cfg, teacher_dim=teacher_dim)
+    ts_space = None
+    if state is not None and "spine_core.A.weight" in state:
+        ts_space = {"rank": int(state["spine_core.A.weight"].shape[0])}
+    model = KSDraftModel(cfg, teacher_dim=teacher_dim,
+                         transfer_space=ts_space)
     if state is not None:
         # A PTQR checkpoint holds the converted module tree (KS3Int8Cell,
         # Int8Linear); the plain model's keys do not match it.

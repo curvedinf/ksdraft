@@ -1,20 +1,21 @@
-"""DSpine-style gated adjacent injection + per-layer transfer-space features.
+"""DSpine gated adjacent injection, implemented to the paper's equations.
 
-Mechanism (DSpine, arXiv 2609.36173): at every layer, each position receives
-its predecessor's *predicted feature*, gated by both the current state and the
-injected feature, so the causal conditioning chain unfolds over network depth
-while positions still update in one pass:
+Reference: arXiv 2609.36173 (Tencent), Sections 4.1-4.4.
 
-    p_t   = F(z_t)                     # predicted feature (transfer space)
-    g_t   = sigmoid(G_q z_t + G_p p_{t-1} + b)
-    z'_t  = z_t + g_t * (A p_{t-1})
+At every layer, after the layer's update:
 
-`p_t` is exposed per layer for the transfer-space auxiliary loss (align with
-the embedding of the correct next token — DSpine's unified transfer space).
+    z_l,t   = sqrt(r) * normalize(R_l u_l,t)          # predicted feature
+    g_l,t   = sigmoid(G_q z_l,t + G_p z_l,t-1 + b)    # shared G_q, G_p, b
+    m_l,t   = A z_l,t-1                               # shared A
+    h_l,t   = u_l,t + RMS(u_l,t) * W_l (g_l,t * m_l,t)   # per-layer W_l
 
-All gates/injections are low-rank so the mechanism stays a small fraction of
-the layer budget (configurable; defaults add ~0.5M params/layer at d=1536,
-~1% of the total, not counted in the core Section 9 formulas).
+A, G_q, G_p, b are shared across layers; W_l is per layer. Position 0 (the
+anchor) has no in-block predecessor and stays unchanged. G_p, W_l and b are
+zero-initialized, so every injection starts as the identity map.
+
+Predicted features live in the unified transfer space C (a whitened PCA of
+the target LM head): a known token enters as sqrt(r) C_x, and the layer-wise
+embedding loss aligns the post-injection readout f_l(h_l,t) with C_{y_t}.
 """
 
 from __future__ import annotations
@@ -24,45 +25,67 @@ from torch import nn
 import torch.nn.functional as F
 
 
-class _LowRank(nn.Module):
-    def __init__(self, width: int, rank: int):
-        super().__init__()
-        self.down = nn.Linear(width, rank, bias=False)
-        self.up = nn.Linear(rank, width, bias=False)
-        nn.init.zeros_(self.up.weight)
+class SpineCore(nn.Module):
+    """Parameters shared by every layer's injection (paper: A, G_q, G_p, b)."""
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.up(self.down(x))
+    def __init__(self, rank: int):
+        super().__init__()
+        self.rank = rank
+        self.A = nn.Linear(rank, rank, bias=False)
+        self.Gq = nn.Linear(rank, rank, bias=False)
+        self.Gp = nn.Linear(rank, rank, bias=False)
+        self.b = nn.Parameter(torch.zeros(rank))
+        nn.init.zeros_(self.Gp.weight)     # paper: G_p zero, W_l zero
+        # A is NOT zero-initialized in the paper; the identity at init comes
+        # from W_l = 0. Keep PyTorch's default init so A is trainable from
+        # the start rather than from a degenerate zero map.
 
 
 class AdjacentInjection(nn.Module):
-    def __init__(self, width: int, rank: int = 32, feature_rank: int = 64):
+    def __init__(self, width: int, rank: int, core: SpineCore,
+                 transfer_C: torch.Tensor | None = None,
+                 R_init: torch.Tensor | None = None):
         super().__init__()
         self.width = width
-        self.feature_down = nn.Linear(width, feature_rank, bias=False)
-        self.feature_up = nn.Linear(feature_rank, width, bias=False)
-        self.gate_q = _LowRank(width, rank)
-        self.gate_p = _LowRank(width, rank)
-        self.gate_bias = nn.Parameter(torch.zeros(width))
-        self.inject = _LowRank(width, rank)
+        self.rank = rank
+        # shared core is intentionally not registered as a submodule here
+        object.__setattr__(self, "_core", core)
+        self.R = nn.Linear(width, rank, bias=False)     # layer readout
+        self.W = nn.Linear(rank, width, bias=False)     # layer write
+        nn.init.zeros_(self.W.weight)                   # identity at init
+        if R_init is not None:
+            with torch.no_grad():
+                self.R.weight.copy_(R_init)
+        if transfer_C is not None:
+            self.register_buffer("C", transfer_C, persistent=False)
+        else:
+            self.C = None
 
     def extra_repr(self) -> str:
-        return f"width={self.width}"
+        return f"width={self.width}, rank={self.rank}"
 
-    def predicted_feature(self, z: torch.Tensor) -> torch.Tensor:
-        """p_t: this layer's prediction of the next token's feature."""
-        return self.feature_up(self.feature_down(z))
+    def feature(self, h: torch.Tensor) -> torch.Tensor:
+        return self.rank ** 0.5 * F.normalize(self.R(h), dim=-1)
 
-    def forward(
-        self, z: torch.Tensor, prev_layer_feature: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (z', p) where p is this layer's predicted feature (for the
-        transfer-space loss). `prev_layer_feature`, when given, seeds position
-        0's injected feature from the previous layer's prediction."""
-        p = self.predicted_feature(z)
-        p_prev = F.pad(p, (0, 0, 1, 0))[:, :-1, :]
-        if prev_layer_feature is not None:
-            p_prev = torch.cat([prev_layer_feature[:, :1, :], p_prev[:, 1:, :]], dim=1)
-        gate = torch.sigmoid(
-            self.gate_q(z) + self.gate_p(p_prev) + self.gate_bias)
-        return z + gate * self.inject(p_prev), p
+    def forward(self, u: torch.Tensor, prev_tokens: torch.Tensor | None = None,
+                sub_prob: float = 0.0):
+        """u: (B, T, d) -> (post-injection h, transfer readout e)."""
+        z = self.feature(u)
+        z_prev = torch.zeros_like(z)
+        z_prev[:, 1:] = z[:, :-1]
+        if (self.training and sub_prob > 0.0 and self.C is not None
+                and prev_tokens is not None):
+            # teacher forcing: replace shallow predecessor features with the
+            # correct token's transfer embedding, then phase out (paper 4.5)
+            tok = self.C[prev_tokens].to(z.dtype) * self.rank ** 0.5
+            tok = F.normalize(tok, dim=-1) * self.rank ** 0.5
+            mask = (torch.rand(z.shape[:2], device=z.device) < sub_prob)
+            mask[:, 0] = False
+            z_prev = torch.where(mask.unsqueeze(-1), tok, z_prev)
+        core = self._core
+        g = torch.sigmoid(core.Gq(z) + core.Gp(z_prev) + core.b)
+        m = core.A(z_prev)
+        rms = u.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt()
+        h = u + rms * self.W(g * m)
+        e = self.feature(h)                       # post-injection readout
+        return h, e
