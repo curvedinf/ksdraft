@@ -98,6 +98,7 @@ def test_full_shape_param_budget():
     ln_params = cfg.layers * 2 * 2 * d + 2 * 2 * d  # 2 norms/block + in/out
     block_head = cfg.block_len * d
     conv = 2 * d + 2 * d * d          # base taps + dynamic projection
+    selector = 3 * d * 256            # predecessor/successor/context projections
     assert counts["extras"] == (cfg.layers * injection_per_layer + ln_params
-                                + block_head + conv)
-    assert counts["total"] == 978_138_016 + block_head + conv
+                                + block_head + conv + selector)
+    assert counts["total"] == 978_138_016 + block_head + conv + selector

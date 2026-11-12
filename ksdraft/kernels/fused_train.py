@@ -213,3 +213,15 @@ def block_position_weights(n: int, decay: float, device,
     if mode == "gamma":
         return torch.exp(-k / decay)
     return decay ** k
+
+
+def linear_topk(x: torch.Tensor, weight: torch.Tensor, k: int,
+                chunk: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k unary values/ids per row without keeping full vocab logits."""
+    wf = weight if weight.dtype == x.dtype else weight.to(x.dtype)
+    vals, ids = [], []
+    for s, e, logits in _chunk_logits(x, wf, chunk):
+        v, i = logits.float().topk(k, dim=-1)
+        vals.append(v)
+        ids.append(i)
+    return torch.cat(vals), torch.cat(ids)

@@ -22,6 +22,7 @@ from torch import nn
 from ..config import KSDraftConfig
 from .block import DraftBlock
 from .blockconv import BlockConv
+from .selector import BlockSelector
 
 
 class KSDraftModel(nn.Module):
@@ -48,6 +49,8 @@ class KSDraftModel(nn.Module):
         # DFlash2-style intra-block conditioning on the offset states; identity
         # at init so existing checkpoints and exports are unchanged.
         self.block_conv = BlockConv(cfg.d_model)
+        # DFlash2 pairwise path selector over the block head's unary top-K.
+        self.block_selector = BlockSelector(cfg.d_model, rank=256)
 
         if teacher_dim:
             self.teacher_proj = nn.Linear(teacher_dim, cfg.d_model, bias=False)
@@ -124,6 +127,70 @@ class KSDraftModel(nn.Module):
         """
         h, features, hs = self.forward_block_hidden(tokens, n, teacher_states)
         return self.head(h), features, hs @ self.head.weight.t()
+
+    def selector_loss(self, hs: torch.Tensor, tokens: torch.Tensor,
+                      anchor: int, bn: int, topk: int = 16) -> torch.Tensor:
+        """DFlash2 selector CE over each offset's unary top-K candidates.
+
+        The predecessor is teacher-forced: offset j scores candidate b given
+        token anchor+j; the label is token anchor+1+j. The target replaces
+        the weakest unary candidate when it is outside the top-K (Speculators
+        behaviour) so the K-way CE is always defined.
+        """
+        from ..kernels.fused_train import linear_topk
+
+        b, n, d = hs.shape
+        flat = hs.reshape(-1, d)
+        vals, ids = linear_topk(flat, self.head.weight, topk)
+        n_rows = b * n
+        pred = torch.stack([tokens[:, anchor + j] for j in range(bn)],
+                           1).reshape(-1)
+        tgt = torch.stack([tokens[:, anchor + 1 + j] for j in range(bn)],
+                          1).reshape(-1)
+        emb = self.embedding.weight
+        # replace the weakest candidate when the label is absent
+        present = (ids == tgt[:, None]).any(-1)
+        if not bool(present.all()):
+            row = torch.arange(n_rows, device=hs.device)
+            w_tgt = emb[tgt]
+            u_tgt = (flat * w_tgt).sum(-1)
+            ids[row, -1] = tgt
+            vals[row, -1] = u_tgt
+        cand_emb = emb[ids]
+        prev_emb = emb[pred]
+        scores = self.block_selector.score_candidates(
+            flat, vals, cand_emb, prev_emb)
+        target_idx = (ids == tgt[:, None]).float().argmax(-1)
+        return torch.nn.functional.cross_entropy(scores, target_idx)
+
+    @torch.no_grad()
+    def propose_block_tokens(self, tokens: torch.Tensor, n: int,
+                             topk: int = 16) -> torch.Tensor:
+        """Greedy selector walk over the block candidates (serving path).
+
+        Starts from the last verified token and conditions each position on
+        the token selected at the previous position.
+        """
+        from ..kernels.fused_train import linear_topk
+
+        self.eval()
+        _h, _f, hs = self.forward_block_hidden(tokens, n)
+        b, nn_, d = hs.shape
+        vals, ids = linear_topk(hs.reshape(-1, d), self.head.weight, topk)
+        vals = vals.view(b, nn_, topk)
+        ids = ids.view(b, nn_, topk)
+        emb = self.embedding.weight
+        prev = tokens[:, -1]
+        out = []
+        for j in range(nn_):
+            cand_emb = emb[ids[:, j]]
+            scores = self.block_selector.score_candidates(
+                hs[:, j], vals[:, j], cand_emb, emb[prev])
+            pick = scores.argmax(-1)
+            tok = ids[:, j].gather(1, pick[:, None]).squeeze(1)
+            out.append(tok)
+            prev = tok
+        return torch.stack(out, dim=1)
 
     def block_logits(self, tokens: torch.Tensor, n: int,
                      teacher_states: torch.Tensor | None = None

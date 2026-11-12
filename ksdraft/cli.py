@@ -68,6 +68,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--lr-schedule", default=None,
                          choices=["cosine", "wsd"])
     p_train.add_argument("--block-position-decay", type=float, default=None)
+    p_train.add_argument("--selector-weight", type=float, default=None,
+                         help="DFlash2 pairwise path-selector CE weight")
     p_train.add_argument("--block-ce-weight", type=float, default=None,
                          help="hard block-CE auxiliary in the distill stage")
     p_train.add_argument("--embedding-init", default=None,
@@ -262,6 +264,9 @@ def _cmd_train(args: argparse.Namespace) -> int:
         block_ce_weight=(args.block_ce_weight
                          if args.block_ce_weight is not None
                          else TrainConfig.block_ce_weight),
+        selector_weight=(args.selector_weight
+                         if args.selector_weight is not None
+                         else TrainConfig.selector_weight),
         roll_every_sec=(args.roll_every if args.roll_every is not None
                         else TrainConfig.roll_every_sec),
         eval_cache=(args.eval_cache if args.eval_cache is not None

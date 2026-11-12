@@ -48,6 +48,9 @@ def main() -> int:
     ap.add_argument("--block-ce", type=float, default=0.1,
                     help="hard-CE auxiliary on the block offsets (standard: "
                          "small, the forward KL is primary)")
+    ap.add_argument("--selector-weight", type=float, default=1.0,
+                    help="DFlash2 pairwise path-selector CE weight")
+    ap.add_argument("--selector-topk", type=int, default=16)
     args = ap.parse_args()
 
     from ksdraft.cli import _load_target_config
@@ -81,8 +84,9 @@ def main() -> int:
         print("[distill] embedding/head frozen", flush=True)
     if args.init:
         ck = torch.load(args.init, map_location="cpu", weights_only=False)
-        model.load_state_dict(ck["model"])
-        print(f"[distill] init from {args.init} (step {ck.get('step')})")
+        missing, _ = model.load_state_dict(ck["model"], strict=False)
+        print(f"[distill] init from {args.init} (step {ck.get('step')}"
+              f"{f', {len(missing)} new surfaces' if missing else ''})")
     params = [p for p in model.parameters() if p.requires_grad]
     try:
         opt = torch.optim.AdamW(params, lr=args.lr,
@@ -134,8 +138,11 @@ def main() -> int:
         ctx_len = min(self_seq_len, T)
         anchor = ctx_len - 1
         bn = min(args.block_n, T - anchor)
-        if bn > 0 and (args.block_kl > 0 or args.block_ce > 0):
-            hs = h[:, anchor].unsqueeze(1) + model.block_delta[:bn].unsqueeze(0)
+        if bn > 0 and (args.block_kl > 0 or args.block_ce > 0
+                       or args.selector_weight > 0):
+            hs = model.block_conv(
+                h[:, anchor].unsqueeze(1)
+                + model.block_delta[:bn].unsqueeze(0))
             ids_off = torch.stack(
                 [ids[:, anchor + j] for j in range(bn)], 1).reshape(-1, k)
             p_off = torch.stack(
@@ -154,6 +161,11 @@ def main() -> int:
                                    args.chunk)
                 loss = loss + args.block_ce * bce
                 parts["block_ce"] = float(bce.detach())
+            if args.selector_weight > 0:
+                sel = model.selector_loss(hs, w, anchor, bn,
+                                          topk=args.selector_topk)
+                loss = loss + args.selector_weight * sel
+                parts["selector"] = float(sel.detach())
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -162,6 +174,7 @@ def main() -> int:
             el = time.time() - t0
             print(f"[distill {step:4d}] loss {loss.item():.4f} ce {parts['ce']:.4f} "
                   f"kl {parts.get('kl', 0):.4f} bkl {parts.get('block_kl', 0):.4f} "
+                  f"sel {parts.get('selector', 0):.4f} "
                   f"wtv {parts.get('wtv', 0):.4f} "
                   f"({args.batch * (step + 1) / max(1e-9, el):.0f} win/s)",
                   flush=True)

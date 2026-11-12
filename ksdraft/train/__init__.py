@@ -64,6 +64,10 @@ class TrainConfig:
     # only); block_weight stays the phase-A hard-CE primary.
     block_kl_weight: float = 1.0
     block_ce_weight: float = 0.1
+    # DFlash2 pairwise path selector: K-way CE over each offset's unary
+    # top-K, teacher-forcing the predecessor. Zero-init pair term, so the
+    # objective starts equal to the unary argmax.
+    selector_weight: float = 1.0
     # Schedule: "cosine" (reference) or "wsd" (warmup-stable-decay, the
     # speedrun-proven shape for longer runs / late annealing).
     lr_schedule: str = "cosine"
@@ -415,6 +419,10 @@ class Trainer:
             parts = {"ce": float(ce.detach()),
                      "transfer": float(ts.detach()),
                      "block_ce": float(bce.detach())}
+            if self.cfg.selector_weight > 0:
+                sel = model.selector_loss(hs, tokens, self.cfg.seq_len - 1, bn)
+                loss = loss + self.cfg.selector_weight * sel
+                parts["selector"] = float(sel.detach())
             if tp is not None and self.cfg.kl_weight > 0:
                 k = tp.shape[-1]
                 kl, topk_logp = linear_soft_ce(
