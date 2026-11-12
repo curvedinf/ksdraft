@@ -350,6 +350,26 @@ target-state-free route was considered and not selected.
 - KS3 trails matched MLPs slightly at small scale; its justification here is fused
   W8A8 speed, which is what a drafter needs.
 
+### Resolutions (2026-11-12, §7 audit)
+- **Rosa counterfactual backward:** the CUDA port exists (`HardRosaGPU`, T<=63)
+  and is now validated in-repo against the definition directly — for every Q/K/V
+  bit, flip it, recompute the hard match, project the output change on the
+  incoming gradient, apply the Bernoulli logit map
+  (`tests/test_rosa_credit_bruteforce.py`). This does not require the external
+  engine checkout; production training still defaults to STE for speed, with
+  the exact path available for gates/short fine-tunes. The "small-scale quality"
+  caveat is empirical, not a mechanism gap.
+- **DSpine x Rosa binarization:** injection is applied to the continuous
+  post-block residual stream (and the transfer readout), never to the binarized
+  symbol path, so the inject-before/after-binarization question does not arise
+  in this design.
+- **JetSpec++ consequences:** the target-hidden seam and foresight adapter exist
+  (`teacher_proj`, `ForesightAdapter`), but the live path uses an HTTP teacher
+  that returns logprobs only, so the adapter cannot be trained here; async
+  drafting/verification overlap is absent from the synchronous speculator.
+- **KS3 justification:** fused W8A8 speed is implemented (Triton forward +
+  int8 tier); the small-scale accuracy caveat remains empirical.
+
 ---
 
 ## 8. Training numerics — DECIDED: full native INT8 forward and backward, FP16 gradient handoff
