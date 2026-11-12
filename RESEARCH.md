@@ -296,6 +296,26 @@ target-state-free route was considered and not selected.
     https://github.com/curvedinf/k-splanifolds/blob/main/experiments/rwkv7_ks2/reports/2026-10-23-rank1-int8-tp/REPORT.md
   - Paper (Zenodo DOI): https://doi.org/10.5281/zenodo.18673034
 
+### Implementation (2026-11-12, §5 audit)
+- Rosa now has the reference's **learned empty payload**: matched-1 -> +payload,
+  matched-0 -> -payload, no match -> -empty; fused Triton kernel carries the
+  no-match mask and both parameter gradients. Initialised to 1.0, so behaviour
+  (and old checkpoints) are unchanged until trained.
+- The exact counterfactual-credit backward exists in both forms
+  (`kernels/rosa_credit.py` C++ engine, `kernels/rosa_credit_gpu.py` GPU
+  exact, parity-tested); training still defaults to the STE path for speed,
+  as documented.
+- Intentional scope limits: symbols are 1-bit (the decided config), not the
+  upstream 1-64 packed capability; decode is sequence-level per window with
+  no draft KV cache and no constant-state incremental recurrence.
+- KS3 matches the reference arithmetic (Hermite cubic + two Chebyshev warp
+  terms, per-chart warp scale/shift, coordinate bypass, ReLU^2; param count
+  locked by test). The int8 tier uses the fork's GS128 contract, not the
+  reference's GS32.
+- Shape note for Section 9: `KSDraftConfig` defaults are the decided
+  1792/597/6869, but `configs/flint.yaml` overrides to 1536/512/5888 — all
+  training so far used the narrower YAML shape.
+
 ---
 
 ## 6. Architecture map (which tech fills which role)

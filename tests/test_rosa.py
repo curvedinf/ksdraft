@@ -61,8 +61,8 @@ def test_param_count_and_zero_init():
     cfg = KSDraftConfig()
     m = RosaMixer(96, 32)
     n = sum(p.numel() for p in m.parameters())
-    # config formula at d=96, s=32: 4*96*32 + 4*96 + 4*32
-    assert n == 4 * 96 * 32 + 4 * 96 + 4 * 32
+    # config formula at d=96, s=32: 4ds + 4d + 5s (empty payload included)
+    assert n == 4 * 96 * 32 + 4 * 96 + 5 * 32
 
     torch.manual_seed(0)
     m2 = RosaMixer(96, 32).eval()

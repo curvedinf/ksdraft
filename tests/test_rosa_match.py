@@ -83,3 +83,34 @@ def test_rosa_mixer_module_parity():
     assert torch.allclose(out, out2, atol=1e-5)
     for n, p in m2.named_parameters():
         assert torch.allclose(p.grad, grads[n], atol=1e-5), n
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+def test_empty_payload_semantics_and_grads():
+    """matched-1 -> +payload, matched-0 -> -payload, no match -> -empty."""
+    from ksdraft.model.rosa import _match_payload_sign_scan
+
+    torch.manual_seed(9)
+    B, T, S = 1, 4, 6
+    q = torch.randn(B, T, S, device="cuda")
+    k = torch.randn(B, T, S, device="cuda")
+    v = torch.randn(B, T, S, device="cuda")
+    pay = torch.full((S,), 2.0, device="cuda", requires_grad=True)
+    emp = torch.full((S,), 3.0, device="cuda", requires_grad=True)
+    out = rosa_match(q, k, v, pay, emp)
+    with torch.no_grad():
+        qb = (q > 0).to(torch.int8).permute(0, 2, 1)
+        kb = (k > 0).to(torch.int8).permute(0, 2, 1)
+        vb = (v > 0).to(torch.int8).permute(0, 2, 1)
+        sign, has = _match_payload_sign_scan(qb, kb, vb, return_has=True)
+        ref = torch.where(has, pay[None, :, None] * sign,
+                          -emp[None, :, None]).permute(0, 2, 1)
+    assert torch.equal(out, ref)
+    out.sum().backward()
+    # payload gradient: +1 per matched-1, -1 per matched-0; empty only at
+    # no-match positions
+    hasf = has.float()
+    exp_pay = (sign * hasf).sum(dim=(0, 2))
+    exp_emp = (-(1.0 - hasf)).sum(dim=(0, 2))
+    assert torch.allclose(pay.grad, exp_pay)
+    assert torch.allclose(emp.grad, exp_emp)

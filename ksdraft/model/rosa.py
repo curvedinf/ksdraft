@@ -118,6 +118,9 @@ class RosaMixer(nn.Module):
         self.time_mix_k = nn.Parameter(torch.zeros(d_model))
         self.time_mix_v = nn.Parameter(torch.zeros(d_model))
         self.payload = nn.Parameter(torch.ones(streams))
+        # Reference Rosa has a learned empty payload for the no-match case;
+        # initialised to 1 so the behaviour equals the old -payload default.
+        self.empty_payload = nn.Parameter(torch.ones(streams))
         # Training-mode gradient path for the hard symbol core:
         #   "exact"  — batched counterfactual credits (HardRosaGPU; O(T^4),
         #              capped at T <= 63; the parity reference, used by gates
@@ -169,7 +172,8 @@ class RosaMixer(nn.Module):
             # backward directly (no dense match tensors, no additive trick).
             from ..kernels.rosa_match import fused_enabled, rosa_match
             if fused_enabled(q_full):
-                hard = rosa_match(q_full, k_full, v_full, self.payload)
+                hard = rosa_match(q_full, k_full, v_full, self.payload,
+                                  self.empty_payload)
                 return self.out_proj(hard.to(x.dtype))
             # Adding (x - x.detach()) leaves the value unchanged (numerically
             # zero) while giving the projections/time mixes a gradient.
@@ -177,8 +181,12 @@ class RosaMixer(nn.Module):
                 bits = ((q_full > 0).to(torch.int8).permute(0, 2, 1),
                         (k_full > 0).to(torch.int8).permute(0, 2, 1),
                         (v_full > 0).to(torch.int8).permute(0, 2, 1))
-                sign = _match_payload_sign_scan(*bits)            # (B, S, T)
-            hard = (self.payload[None, :, None] * sign).permute(0, 2, 1)
+                sign, has = _match_payload_sign_scan(*bits,
+                                                     return_has=True)
+            hard = torch.where(
+                has,
+                self.payload[None, :, None] * sign,
+                -self.empty_payload[None, :, None]).permute(0, 2, 1)
             hard = hard + (q_full - q_full.detach()) \
                         + (k_full - k_full.detach()) \
                         + (v_full - v_full.detach())
@@ -187,7 +195,8 @@ class RosaMixer(nn.Module):
         from ..kernels.rosa_match import fused_enabled, rosa_match
         qf, kf, vf = self.q_proj(q_in), self.k_proj(k_in), self.v_proj(v_in)
         if fused_enabled(qf):
-            hard = rosa_match(qf, kf, vf, self.payload)
+            hard = rosa_match(qf, kf, vf, self.payload,
+                              self.empty_payload)
             return self.out_proj(hard.to(x.dtype))
         with torch.no_grad():
             qbits = (qf > 0).to(torch.int8)   # (B, T, S)
@@ -195,10 +204,11 @@ class RosaMixer(nn.Module):
             vbits = (vf > 0).to(torch.int8)
 
             # per-stream match over (B, S) leading dims
-            sign = _match_payload_sign_scan(
-                qbits.permute(0, 2, 1), kbits.permute(0, 2, 1), vbits.permute(0, 2, 1)
-            )  # (B, S, T)
-        out = self.payload[None, :, None] * sign         # (B, S, T) fp32
+            sign, has = _match_payload_sign_scan(
+                qbits.permute(0, 2, 1), kbits.permute(0, 2, 1),
+                vbits.permute(0, 2, 1), return_has=True)
+        out = torch.where(has, self.payload[None, :, None] * sign,
+                          -self.empty_payload[None, :, None])   # (B,S,T)
         return self.out_proj(out.permute(0, 2, 1).to(x.dtype))
 
 
@@ -257,8 +267,8 @@ def _match_payload_sign_fast(
 
 def _match_payload_sign_scan(
     qbits: torch.Tensor, kbits: torch.Tensor, vbits: torch.Tensor,
-    max_match_len: int | None = None,
-) -> torch.Tensor:
+    max_match_len: int | None = None, return_has: bool = False,
+):
     """Longest-suffix-match payload signs, fully vectorized in t.
 
     Along the anti-diagonal ``t - j = const`` the recurrence
@@ -310,4 +320,5 @@ def _match_payload_sign_scan(
     succ = (latest.clamp_min(0) + 1).clamp_max(t_len - 1).long()
     v_succ = torch.gather(v, -1, succ)
     v_sign = torch.where(v_succ > 0, 1.0, -1.0)
-    return torch.where(has, v_sign, sign)
+    out = torch.where(has, v_sign, sign)
+    return (out, has) if return_has else out

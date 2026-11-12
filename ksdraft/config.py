@@ -10,7 +10,7 @@ The backbone is RWKV-8 proper: the Rosa QKV mixer IS the time-mixing layer
 
   - Rosa QKV mixer: 4*d*s (three biased input projections d->s and one
     biased output projection s->d) + 4*d (three time-mix vectors + output
-    bias) + 4*s (three input biases + payload scales)
+    bias) + 5*s (three input biases + payload scales + learned empty payload)
   - KS3 decoder: charts * (2*d + 6) + 2*charts (rank-1 subspaces; six spine
     coefficients per output coordinate, warp scale/shift per chart)
 
@@ -70,9 +70,10 @@ class KSDraftConfig:
 
     def rosa_params(self) -> int:
         # Three biased input projections d->s (+3s), biased output s->d (+d),
-        # three d-dim time-mix vectors (+3d), payload scales (+s).
+        # three d-dim time-mix vectors (+3d), payload scales (+s) and the
+        # learned empty payload (+s).
         d, s = self.d_model, self.rosa_streams
-        return 4 * d * s + 4 * d + 4 * s
+        return 4 * d * s + 4 * d + 5 * s
 
     def ks3_params(self) -> int:
         d, c = self.d_model, self.charts

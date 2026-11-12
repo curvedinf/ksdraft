@@ -45,8 +45,9 @@ def fused_enabled(q: torch.Tensor) -> bool:
 
 if _HAS_TRITON:
     @triton.jit
-    def _match_kernel(q_ptr, k_ptr, v_ptr, pay_ptr, hard_ptr, sign_ptr,
-                      S, T: tl.constexpr, BS: tl.constexpr):
+    def _match_kernel(q_ptr, k_ptr, v_ptr, pay_ptr, empty_ptr, hard_ptr,
+                      sign_ptr, has_ptr, S, T: tl.constexpr,
+                      BS: tl.constexpr):
         b = tl.program_id(0)
         s0 = tl.program_id(1) * BS
         ss = s0 + tl.arange(0, BS)
@@ -77,14 +78,18 @@ if _HAS_TRITON:
                           axis=0) > 0
             sign = tl.where(best > 0, tl.where(vb_s, 1.0, -1.0), -1.0)
             pay = tl.load(pay_ptr + ss, mask=sm, other=0.0).to(tl.float32)
-            tl.store(hard_ptr + base + t * S + ss, pay * sign, mask=sm)
+            emp = tl.load(empty_ptr + ss, mask=sm, other=0.0).to(tl.float32)
+            h = tl.where(best > 0, pay * sign, -emp)
+            tl.store(hard_ptr + base + t * S + ss, h, mask=sm)
             tl.store(sign_ptr + b * S * T + ss * T + t, sign, mask=sm)
+            tl.store(has_ptr + b * S * T + ss * T + t,
+                     (best > 0).to(tl.float32), mask=sm)
             prev = cur
 
 
 class _RosaMatch(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, payload):
+    def forward(ctx, q, k, v, payload, empty):
         B, T, S = q.shape
         # tl.arange needs a power-of-two extent; zero-padding the time axis
         # cannot change any t < T because matches only look strictly earlier.
@@ -95,20 +100,30 @@ class _RosaMatch(torch.autograd.Function):
         hard = torch.empty((B, Tp, S), device=q.device, dtype=q.dtype)
         # the kernel indexes sign with the padded T
         sign = torch.empty((B, S, Tp), device=q.device, dtype=torch.float32)
+        has = torch.empty((B, S, Tp), device=q.device, dtype=torch.float32)
         grid = (B, triton.cdiv(S, BLOCK_S))
-        _match_kernel[grid](q, k, v, payload, hard, sign, S, T=Tp,
-                            BS=BLOCK_S, num_warps=4)
-        ctx.save_for_backward(sign[:, :, :T])
+        _match_kernel[grid](q, k, v, payload, empty, hard, sign, has, S,
+                            T=Tp, BS=BLOCK_S, num_warps=4)
+        ctx.save_for_backward(sign[:, :, :T], has[:, :, :T])
         return hard[:, :T]
 
     @staticmethod
     def backward(ctx, dhard):
-        (sign,) = ctx.saved_tensors
-        dp = (dhard.float().permute(0, 2, 1) * sign).sum(dim=(0, 2))
-        return dhard, dhard, dhard, dp
+        sign, has = ctx.saved_tensors
+        dh = dhard.float().permute(0, 2, 1)          # [B, S, T]
+        dp = (dh * sign * has).sum(dim=(0, 2))
+        de = -(dh * (1.0 - has)).sum(dim=(0, 2))
+        return dhard, dhard, dhard, dp, de
 
 
 def rosa_match(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-               payload: torch.Tensor) -> torch.Tensor:
-    """payload * exact hard-match sign, with the STE/payload backward."""
-    return _RosaMatch.apply(q, k, v, payload)
+               payload: torch.Tensor, empty: torch.Tensor | None = None
+               ) -> torch.Tensor:
+    """Exact hard match with payload (+/-) and the learned empty payload.
+
+    Matched-1 -> +payload, matched-0 -> -payload, no match -> -empty.
+    Backward: STE identity on Q/K/V plus both payload gradients.
+    """
+    if empty is None:
+        empty = payload
+    return _RosaMatch.apply(q, k, v, payload, empty)

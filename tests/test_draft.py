@@ -108,7 +108,7 @@ def test_full_shape_param_budget():
                                               device="meta"),
                              "rank": rank})
     counts = model.param_counts()
-    assert counts["core"] == cfg.total_params() == 964_153_248
+    assert counts["core"] == cfg.total_params() == 964_167_576
     d = cfg.d_model
     ln_params = cfg.layers * 2 * 2 * d + 2 * 2 * d  # 2 norms/block + in/out
     block_head = cfg.block_len * d

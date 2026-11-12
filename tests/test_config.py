@@ -12,12 +12,12 @@ def test_decided_shape_budget():
     assert cfg.charts == 6869  # round(1792 * 368 / 96)
     assert cfg.rosa_streams == 597  # round(1792 * 32 / 96)
 
-    assert cfg.rosa_params() == 4_288_852  # 4ds + 4d + 4s (biased projections)
+    assert cfg.rosa_params() == 4_289_449  # 4ds + 4d + 5s (incl. empty payload)
     assert cfg.ks3_params() == 24_673_448
-    assert cfg.layer_params() == 28_962_300
+    assert cfg.layer_params() == 28_962_897
 
     assert cfg.embedding_params() == 150_144 * 1792
-    assert cfg.total_params() == 24 * 28_962_300 + 150_144 * 1792
+    assert cfg.total_params() == 24 * 28_962_897 + 150_144 * 1792
     assert 0.95e9 < cfg.total_params() < 0.98e9  # ~0.96B core (~1B envelope)
 
 
