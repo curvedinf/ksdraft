@@ -70,6 +70,10 @@ class TrainConfig:
     selector_weight: float = 1.0
     # DSpine last-write refinement CE at the block head (paper 4.3/4.5).
     lwr_weight: float = 1.0
+    # DSpine Eq. 7 mixes CE with the probability L1 (2 x TV on the support).
+    # block_ce_weight is alpha; this weight is (1-alpha) * 2 on the same
+    # decayed block positions.
+    block_wtv_weight: float = 0.0
     # DSpine layer-wise embedding loss: cosine to the unified transfer space,
     # position decay w_i = exp(-(i)/gamma) (paper Eq. 6).
     transfer_gamma: float = 2.0
@@ -463,11 +467,15 @@ class Trainer:
                     p_off = torch.stack(
                         [tp[:, anchor + j] for j in range(bn)], 1).reshape(-1, k)
                     w_off = bw_off.repeat(h.shape[0])
-                    bkl, _ = linear_soft_ce(
+                    bkl, b_logp = linear_soft_ce(
                         hs.reshape(-1, d), w, ids_off, p_off, w_off,
                         self.cfg.head_chunk, weight_norm="count")
                     loss = loss + self.cfg.block_kl_weight * bkl
                     parts["block_kl"] = float(bkl.detach())
+                    if self.cfg.block_wtv_weight > 0:
+                        bwtv = wtv_from_logp(b_logp, p_off)
+                        loss = loss + self.cfg.block_wtv_weight * bwtv
+                        parts["block_wtv"] = float(bwtv.detach())
                 if self.cfg.wtv_weight > 0:
                     wtv = wtv_from_logp(topk_logp, tp.reshape(-1, k))
                     loss = loss + self.cfg.wtv_weight * wtv

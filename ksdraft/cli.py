@@ -68,6 +68,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--lr-schedule", default=None,
                          choices=["cosine", "wsd"])
     p_train.add_argument("--block-position-decay", type=float, default=None)
+    p_train.add_argument("--block-wtv", type=float, default=None,
+                         help="block probability-L1 weight (DSpine Eq. 7)")
     p_train.add_argument("--lwr-weight", type=float, default=None,
                          help="DSpine last-write-refinement CE weight")
     p_train.add_argument("--selector-weight", type=float, default=None,
@@ -280,6 +282,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
                          else TrainConfig.selector_weight),
         lwr_weight=(args.lwr_weight if args.lwr_weight is not None
                     else TrainConfig.lwr_weight),
+        block_wtv_weight=(args.block_wtv if args.block_wtv is not None
+                          else TrainConfig.block_wtv_weight),
         roll_every_sec=(args.roll_every if args.roll_every is not None
                         else TrainConfig.roll_every_sec),
         eval_cache=(args.eval_cache if args.eval_cache is not None

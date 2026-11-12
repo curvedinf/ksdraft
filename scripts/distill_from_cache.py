@@ -50,6 +50,8 @@ def main() -> int:
     ap.add_argument("--block-ce", type=float, default=0.1,
                     help="hard-CE auxiliary on the block offsets (standard: "
                          "small, the forward KL is primary)")
+    ap.add_argument("--block-wtv", type=float, default=0.0,
+                    help="block probability-L1 weight (DSpine Eq. 7; L1=2*TV)")
     ap.add_argument("--lwr-weight", type=float, default=1.0,
                     help="DSpine last-write-refinement CE weight")
     ap.add_argument("--selector-weight", type=float, default=1.0,
@@ -163,11 +165,16 @@ def main() -> int:
                 [probs[:, anchor + j] for j in range(bn)], 1).reshape(-1, k)
             bw = block_position_weights(bn, args.block_decay, h.device)
             w_off = bw.repeat(h.shape[0])
-            if args.block_kl > 0:
-                bkl, _ = linear_soft_ce(hs.reshape(-1, d), weight, ids_off,
-                                        p_off, w_off, args.chunk)
+            if args.block_kl > 0 or args.block_wtv > 0:
+                bkl, b_logp = linear_soft_ce(
+                    hs.reshape(-1, d), weight, ids_off, p_off, w_off,
+                    args.chunk, weight_norm="count")
                 loss = loss + args.block_kl * bkl
                 parts["block_kl"] = float(bkl.detach())
+                if args.block_wtv > 0:
+                    bwtv = wtv_from_logp(b_logp, p_off)
+                    loss = loss + args.block_wtv * bwtv
+                    parts["block_wtv"] = float(bwtv.detach())
             if args.block_ce > 0:
                 tgt_off = torch.stack(
                     [w[:, anchor + 1 + j] for j in range(bn)], 1).reshape(-1)
@@ -195,6 +202,7 @@ def main() -> int:
                   f"kl {parts.get('kl', 0):.4f} bkl {parts.get('block_kl', 0):.4f} "
                   f"sel {parts.get('selector', 0):.4f} "
                   f"lwr {parts.get('lwr', 0):.4f} "
+                  f"bwtv {parts.get('block_wtv', 0):.4f} "
                   f"wtv {parts.get('wtv', 0):.4f} "
                   f"({args.batch * (step + 1) / max(1e-9, el):.0f} win/s)",
                   flush=True)

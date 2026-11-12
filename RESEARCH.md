@@ -125,9 +125,13 @@ Researched 2026-11-08. No implementation has begun.
   out-of-set labels). Serving walks the offsets with per-offset rescoring —
   the same result as the paper's K² transition cache for our n=3, without
   precomputing the table.
-- Still open: DSpine's Eq. 7 distillation mix (α·CE + (1-α)·L1) — we use
-  block forward KL + small CE + WTV; γ is not published in the fetched text
-  (Appendix A), so 2.0 is our default.
+- DSpine Eq. 7 mix is supported on the block surface: `block_ce=α`,
+  `block_wtv=2(1-α)` (L1 = 2·TV), share the decayed block weights; the recipe
+  uses α=0.5 with `--block-kl 0`. The LWR output is trained with CE only
+  (the paper also mixes L1 on its candidate set) — noted gap.
+- Still open: γ is not published in the fetched text (Appendix A), so 2.0
+  is our default; the serving walk rescoring is not the K² transition table
+  (same result for n=3).
 
 ---
 
