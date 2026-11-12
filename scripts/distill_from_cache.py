@@ -50,6 +50,15 @@ def main() -> int:
     windows = cache["windows"].long()
     topk_ids = cache["topk_ids"].long()
     topk_probs = cache["topk_probs"].float()
+    # partial mining checkpoints zero-pad beyond the finished prefix; older
+    # checkpoints predate the "filled" key, so infer the prefix from the data
+    if "filled" in cache:
+        filled = int(cache["filled"])
+    else:
+        filled = int((topk_ids.abs().sum(-1) > 0).any(-1).sum())
+    windows = windows[:filled]
+    topk_ids = topk_ids[:filled]
+    topk_probs = topk_probs[:filled]
     n = windows.shape[0]
     print(f"[distill] {n} windows, seq_len={windows.shape[1] - 1}")
 
