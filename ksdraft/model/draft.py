@@ -232,7 +232,7 @@ class KSDraftModel(nn.Module):
 
     @torch.no_grad()
     def propose_block_tokens(self, tokens: torch.Tensor, n: int,
-                             topk: int = 16) -> torch.Tensor:
+                             topk: int = 16, return_conf: bool = False):
         """Greedy selector walk over the block candidates (serving path).
 
         Starts from the last verified token and conditions each position on
@@ -248,7 +248,7 @@ class KSDraftModel(nn.Module):
         ids = ids.view(b, nn_, topk)
         weight = self.head.weight
         prev = tokens[:, -1]
-        out = []
+        out, conf = [], []
         for j in range(nn_):
             # last-write refinement with the decided predecessor token
             h = self.head_write.block_write(hs[:, j:j + 1],
@@ -257,8 +257,14 @@ class KSDraftModel(nn.Module):
             pick = scores.argmax(-1)
             tok = ids[:, j].gather(1, pick[:, None]).squeeze(1)
             out.append(tok)
+            if return_conf:
+                p = torch.softmax(scores.float(), dim=-1)
+                conf.append(p.gather(1, pick[:, None]).squeeze(1))
             prev = tok
-        return torch.stack(out, dim=1)
+        toks = torch.stack(out, dim=1)
+        if return_conf:
+            return toks, torch.stack(conf, dim=1)
+        return toks
 
     def block_logits(self, tokens: torch.Tensor, n: int,
                      teacher_states: torch.Tensor | None = None

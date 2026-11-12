@@ -159,6 +159,21 @@ Researched 2026-11-08. No implementation has begun.
   - News summaries: https://aipolix.com/en-us/news/eagle-4-cost-aware-speculative-decoding-drafter ,
     https://lightseek.org/blog/eagle-4.html
 
+### Implementation (2026-11-12, §3 audit)
+- `adaptive_draft_len` implements the harness control loop at batch level:
+  depth-rising stop when the mean selected-candidate confidence of the next
+  offset falls below `KSDRAFT_CONF_TAU` (default 0.3); the verification
+  budget is capped by load (full block at <=4 concurrent, half at <=8, one
+  above 2x8 — the block analog of EAGLE-4's tree<=4 / chain>=8 switch); at
+  least one token is always proposed.
+- Serving: `KSDRAFT_ADAPT=1` (off by default). The speculator uses the
+  selector walk's candidate probabilities and fills slots past the chosen
+  length with -1, which the rejection sampler treats as "stop".
+- Deltas from the reference: no offline cost-table calibration (the policy
+  uses static thresholds, not measured verify cost); dispatch is per batch,
+  not per request, because the framework's draft tensor is fixed width; no
+  tree fan-out (our drafter is a block, so length is the control variable).
+
 ---
 
 ## 4. Pipelining (throughput) — DECIDED: JetSpec++
