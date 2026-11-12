@@ -612,8 +612,9 @@ class Trainer:
         for step in range(self.cfg.steps):
             batch = self.sampler.batch(self.cfg.batch_size).to(self.device)
             with torch.no_grad():
-                _, features = self.model(batch[:, :-1])
-                hidden = features[-1]  # last-layer drafter state (frozen)
+                # the trunk's final hidden state (features are now 256-d
+                # transfer readouts after the DSpine rewrite)
+                hidden, _ = self.model.trunk(batch[:, :-1])
             flat, _, _ = self._teacher_batch(batch)
             pred_state, pred_logits = adapter(hidden.float())
             loss, parts = foresight_loss(

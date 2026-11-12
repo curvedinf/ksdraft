@@ -114,3 +114,17 @@ def test_lwr_walk_returns_candidates():
     tok = m.propose_block_tokens(ctx, 4, topk=8)
     assert tok.shape == (2, 4)
     assert tok.min() >= 0 and tok.max() < cfg.vocab_size
+
+
+def test_refinement_is_idempotent_at_init():
+    torch.manual_seed(7)
+    from ksdraft.config import KSDraftConfig
+    from ksdraft.model import KSDraftModel
+    cfg = KSDraftConfig(vocab_size=128, d_model=32, layers=2, head_size=16,
+                        rosa_streams=16, ks3_charts=64, block_len=8)
+    m = KSDraftModel(cfg).eval()
+    ctx = torch.randint(0, cfg.vocab_size, (2, 16))
+    # identity head write at init -> refinement cannot change the walk
+    a = m.propose_block_tokens(ctx, 4, refine_iters=0)
+    b = m.propose_block_tokens(ctx, 4, refine_iters=2)
+    assert torch.equal(a, b)

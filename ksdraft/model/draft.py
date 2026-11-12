@@ -232,7 +232,8 @@ class KSDraftModel(nn.Module):
 
     @torch.no_grad()
     def propose_block_tokens(self, tokens: torch.Tensor, n: int,
-                             topk: int = 16, return_conf: bool = False):
+                             topk: int = 16, return_conf: bool = False,
+                             refine_iters: int = 0):
         """Greedy selector walk over the block candidates (serving path).
 
         Starts from the last verified token and conditions each position on
@@ -247,23 +248,37 @@ class KSDraftModel(nn.Module):
         vals = vals.view(b, nn_, topk)
         ids = ids.view(b, nn_, topk)
         weight = self.head.weight
-        prev = tokens[:, -1]
-        out, conf = [], []
-        for j in range(nn_):
-            # last-write refinement with the decided predecessor token
-            h = self.head_write.block_write(hs[:, j:j + 1],
-                                            prev[:, None])[:, 0]
-            scores = (h.unsqueeze(1) * weight[ids[:, j]]).sum(-1)
-            pick = scores.argmax(-1)
-            tok = ids[:, j].gather(1, pick[:, None]).squeeze(1)
-            out.append(tok)
-            if return_conf:
-                p = torch.softmax(scores.float(), dim=-1)
-                conf.append(p.gather(1, pick[:, None]).squeeze(1))
-            prev = tok
-        toks = torch.stack(out, dim=1)
+        anchor_tok = tokens[:, -1]
+
+        def walk(forced):
+            prev = anchor_tok
+            out, conf = [], []
+            for j in range(nn_):
+                # last-write refinement with the decided predecessor token
+                h = self.head_write.block_write(hs[:, j:j + 1],
+                                                prev[:, None])[:, 0]
+                scores = (h.unsqueeze(1) * weight[ids[:, j]]).sum(-1)
+                pick = scores.argmax(-1)
+                tok = ids[:, j].gather(1, pick[:, None]).squeeze(1)
+                out.append(tok)
+                if return_conf:
+                    p = torch.softmax(scores.float(), dim=-1)
+                    conf.append(p.gather(1, pick[:, None]).squeeze(1))
+                prev = tok if forced is None else forced[:, j]
+            return torch.stack(out, dim=1), (
+                torch.stack(conf, dim=1) if return_conf else None)
+
+        toks, conf = walk(None)
+        # JetSpec++ intra-block self refinement: re-run the walk with the
+        # previously selected chain as the predecessor path; fixed point.
+        for _ in range(int(refine_iters)):
+            new, new_conf = walk(toks)
+            same = torch.equal(new, toks)
+            toks, conf = new, new_conf
+            if same:
+                break
         if return_conf:
-            return toks, torch.stack(conf, dim=1)
+            return toks, conf
         return toks
 
     def block_logits(self, tokens: torch.Tensor, n: int,

@@ -226,6 +226,21 @@ target-state-free route was considered and not selected.
 - **vLLM async scheduling x spec decoding compat PR #24799** (overlap infrastructure):
   https://github.com/vllm-project/vllm/pull/24799
 
+### Implementation (2026-11-12, §4 audit)
+- Intra-block self refinement is implemented as a fixed-point iteration over
+  the block walk: the selected chain is fed back as the predecessor path and
+  the last-write/selector scores are recomputed (`KSDRAFT_REFINE_ITERS`,
+  default 0; identity at init, so it is a no-op until trained). This refines
+  token selections, not hidden states as JetSpec++'s denoising loop does.
+- The foresight adapter exists (`ForesightAdapter`, `foresight_loss`) and was
+  fixed after the DSpine rewrite (it now consumes the trunk hidden state, not
+  the 256-d transfer readout). It cannot be trained in the current setup: it
+  needs target hidden states, and the HTTP teacher exposes logprobs only.
+- Pipelined drafting/verification is not implemented: the speculator runs
+  synchronously inside the model-runner step; overlapping block t+1 with
+  verification of block t needs the engine's async scheduling path.
+- D3D remains not selected (per the research decision).
+
 ---
 
 ## 5. Draft backbone components
