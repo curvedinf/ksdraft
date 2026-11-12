@@ -648,6 +648,13 @@ supervision is available on demand, (c) training is **native INT8 end-to-end**
   min(m,n)^2 * max(m,n) and would exceed the rest of the step.
 - **Numerics:** fully INT8 forward/backward, FP16 gradient handoff; rounding dither
   ON (PTQR exploration phase — early training explores neighboring grid points).
+- **Intra-block conditioning (2026-11-12, §1 implementation):** the parallel
+  block head now applies a DFlash2-style two-tap dynamic depthwise conv over
+  the offset states (`model/blockconv.py`), causal and grouped every 16
+  channels, identity-initialized (`base=[1,0]`, zero dynamic) so older
+  checkpoints/exports are unchanged until trained. Remaining §1 gaps: the
+  DFlash2 pairwise path selector, and target hidden-state conditioning
+  (H-Spec / dual-source) which the HTTP teacher cannot supply.
 - **Trunk kernels (2026-11-11):** the KS3 rank-1 geometry chain and the Rosa
   hard-match core run as fused Triton forward/backward kernels
   (`kernels/ks3_geom.py`, `kernels/rosa_match.py`). Measured at B=32: trunk

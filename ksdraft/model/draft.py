@@ -21,6 +21,7 @@ from torch import nn
 
 from ..config import KSDraftConfig
 from .block import DraftBlock
+from .blockconv import BlockConv
 
 
 class KSDraftModel(nn.Module):
@@ -44,6 +45,9 @@ class KSDraftModel(nn.Module):
         # head; the alternative is N autoregressive forwards).
         self.block_delta = nn.Parameter(
             torch.zeros(cfg.block_len, cfg.d_model))
+        # DFlash2-style intra-block conditioning on the offset states; identity
+        # at init so existing checkpoints and exports are unchanged.
+        self.block_conv = BlockConv(cfg.d_model)
 
         if teacher_dim:
             self.teacher_proj = nn.Linear(teacher_dim, cfg.d_model, bias=False)
@@ -106,7 +110,8 @@ class KSDraftModel(nn.Module):
         """
         h, features = self.trunk(tokens, teacher_states)
         anchor = h[:, -1]
-        hs = anchor.unsqueeze(1) + self.block_delta[:n].unsqueeze(0)
+        hs = self.block_conv(anchor.unsqueeze(1)
+                             + self.block_delta[:n].unsqueeze(0))
         return h, features, hs
 
     def forward_block(self, tokens: torch.Tensor, n: int,
@@ -130,7 +135,8 @@ class KSDraftModel(nn.Module):
         """
         h, _ = self.trunk(tokens, teacher_states)
         anchor = h[:, -1]
-        hs = anchor.unsqueeze(1) + self.block_delta[:n].unsqueeze(0)
+        hs = self.block_conv(anchor.unsqueeze(1)
+                             + self.block_delta[:n].unsqueeze(0))
         return hs @ self.head.weight.t()
 
     def param_counts(self) -> dict:

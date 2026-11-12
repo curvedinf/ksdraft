@@ -88,7 +88,7 @@ def test_bf16_forward():
 
 def test_full_shape_param_budget():
     """Decided shape on the meta device: core 964,153,248 + injection/LN extras
-    + the parallel block head offsets = 978,162,592 total."""
+    + block-head offsets + the DFlash2-style intra-block conv."""
     cfg = KSDraftConfig()
     model = KSDraftModel(cfg, device="meta", skip_init=True)
     counts = model.param_counts()
@@ -97,6 +97,7 @@ def test_full_shape_param_budget():
     injection_per_layer = (2 * 64 + 6 * 32) * d + d
     ln_params = cfg.layers * 2 * 2 * d + 2 * 2 * d  # 2 norms/block + in/out
     block_head = cfg.block_len * d
+    conv = 2 * d + 2 * d * d          # base taps + dynamic projection
     assert counts["extras"] == (cfg.layers * injection_per_layer + ln_params
-                                + block_head)
-    assert counts["total"] == 978_138_016 + block_head
+                                + block_head + conv)
+    assert counts["total"] == 978_138_016 + block_head + conv
