@@ -169,7 +169,7 @@ def build_prompts(tok, corpus_path: Path, args, rng: random.Random):
     return out
 
 
-def main() -> int:
+def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True,
                     help="tokenizer/model dir (same one the server serves)")
@@ -188,7 +188,10 @@ def main() -> int:
     ap.add_argument("--concurrency", type=int, default=12)
     ap.add_argument("--greedy-frac", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=11)
-    args = ap.parse_args()
+    return ap
+
+
+def run(args) -> int:
 
     import json as _json
     import concurrent.futures as cf
@@ -262,6 +265,10 @@ def main() -> int:
     (out_dir / "meta.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary), flush=True)
     return 0
+
+
+def main(argv=None) -> int:
+    return run(_parser().parse_args(argv))
 
 
 def torch_save(path: Path, tokens, bounds, meta) -> None:

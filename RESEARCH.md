@@ -1020,9 +1020,11 @@ adopted (user directive), with acceptance gates as the arbiter.
   With Flint's facts (vocab 150144, 2.5B active) it reproduces the decided
   shape exactly: d=1792, 597 streams, 6869 charts, 964,167,576 core, ratio
   0.39 (the section's 1B/2.5B = 0.40).
-- `ksdraft mine` exists but only builds the dev corpus from docs/traces; the
-  live on-policy generation and teacher-top-k mining are standalone scripts
-  (`build_onpolicy_corpus.py`, `mine_teacher_http.py`), not CLI subcommands.
+- `ksdraft mine --live --model <dir>` regenerates the on-policy corpus through
+  the served target (the builder is imported from
+  `scripts/build_onpolicy_corpus.py` as the single implementation); the plain
+  `mine` path still builds the dev corpus from docs/traces. Teacher top-k
+  mining remains `scripts/mine_teacher_http.py`.
 - `ksdraft train`/`gate`/`export` exist. Export emits the int8 safetensors +
   config payload the fork's speculator consumes; the HF-repo pattern
   (checkpoint + modeling code + serving kit) and the SGLang/vLLM adapters are

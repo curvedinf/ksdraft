@@ -40,7 +40,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_size.add_argument("--ks3-charts", type=int, default=0, help="0 = density default (3.83 per width unit)")
     p_size.add_argument("--dtype", default="int8", choices=["int8", "bf16", "fp32"])
 
-    p_mine = sub.add_parser("mine", help="build a corpus (dev: text docs + byte tokenizer)")
+    p_mine = sub.add_parser("mine", help="build a corpus (dev docs or --live)")
+    p_mine.add_argument("--live", action="store_true",
+                        help="regenerate the corpus with the served target")
+    p_mine.add_argument("--model", default=None,
+                        help="tokenizer/model dir for --live")
+    p_mine.add_argument("--base-url", default="http://127.0.0.1:8030/v1")
+    p_mine.add_argument("--api-key", default=None)
+    p_mine.add_argument("--n-code", type=int, default=3000)
+    p_mine.add_argument("--n-agent", type=int, default=300)
+    p_mine.add_argument("--n-doc", type=int, default=100)
+    p_mine.add_argument("--n-chat", type=int, default=400)
+    p_mine.add_argument("--max-new", type=int, default=512)
+    p_mine.add_argument("--concurrency", type=int, default=12)
     p_mine.add_argument("--config", default="configs/flint.yaml")
     p_mine.add_argument("--docs", help="text file, one document per line")
     p_mine.add_argument("--traces", help="text file, one agent trace per line")
@@ -205,9 +217,32 @@ def _cmd_size(args: argparse.Namespace) -> int:
 
 
 def _cmd_mine(args: argparse.Namespace) -> int:
+    import importlib.util
     import json
     import random
     from pathlib import Path
+
+    if getattr(args, "live", False):
+        if not args.model:
+            print("mine --live requires --model (the served model dir)",
+                  file=sys.stderr)
+            return 2
+        script = (Path(__file__).resolve().parents[1]
+                  / "scripts/build_onpolicy_corpus.py")
+        spec = importlib.util.spec_from_file_location(
+            "_ksdraft_onpolicy", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ns = argparse.Namespace(
+            model=args.model, base_url=args.base_url,
+            api_key=(args.api_key or os.environ.get("VLLM_API_KEY", "")),
+            corpus=args.corpus if getattr(args, "corpus", None) else
+            "/home/curved/SDGraft/data/flint_longctx/train_tokens.pt",
+            out=args.out, n_code=args.n_code, n_agent=args.n_agent,
+            n_doc=args.n_doc, n_chat=args.n_chat, max_new=args.max_new,
+            doc_chars=8000, doc_new=256, max_prompt=12000,
+            concurrency=args.concurrency, greedy_frac=0.2, seed=11)
+        return mod.run(ns)
 
     from .data import CorpusConfig, build_corpus, train_val_split
 
