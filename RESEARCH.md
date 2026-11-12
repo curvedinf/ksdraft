@@ -883,6 +883,28 @@ supervision is available on demand, (c) training is **native INT8 end-to-end**
   stages run on MI100 co-located with the live INT8 teacher per Section 10's memory
   budget (~24–26 GB/GPU of 32 GB).
 
+### Implementation status (2026-11-12, §11 audit)
+- Stage 0: CE warm-up + target-SVD embedding init implemented (the warm-up
+  checkpoint is kept as the PTQR init rather than discarded; deviation).
+- Stage 1: mining is HTTP-based over the served recipe (on-policy tokens,
+  top-k logprobs, 20% greedy). Hidden-state taps are missing (Section 10
+  blocker); NIAH exists only as long-document Q&A, not 512k haystacks; anchors
+  are dense random windows (~1 per 16 tokens, above the >=1/64 rule).
+- Stage 2: objective corrected — block forward KL (DFlash default) with the
+  DSpine Eq. 7 CE+L1 mix available (`block_ce`/`block_wtv`), DSpine Eq. 6
+  transfer loss with decay, DFlash2 selector and DSpine last-write refinement.
+  Dual-source teacher-state conditioning is blocked (no hidden states).
+- Stage 3: the DCOCO-style corrector is the selector (top-16 pairs + walk);
+  JetSpec intra-block self refinement is the fixed-point walk.
+- Stage 4: foresight adapter exists but cannot train without target hidden
+  states.
+- Stages 5/6: `_train_refine` and `_train_acceptance` are implemented and now
+  runnable with a **live HTTP teacher** (`ksdraft/teacher/http.py`,
+  `--teacher-http`): one batched /completions call per micro-batch returns
+  serving-truncated top-k logprobs. Live-validated: 4x16 windows, 64/64
+  positions filled, probability sums 0.9998-1.0002. GRPO is not implemented.
+- Stage 7: PTQR + fidelity gates implemented (Section 8 audit).
+
 ---
 
 ## 12. Product & distribution goals — DECIDED 2026-11-08

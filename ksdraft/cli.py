@@ -11,6 +11,7 @@ Commands (RESEARCH.md Section 12A):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .config import KSDraftConfig
@@ -76,6 +77,10 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="DFlash2 pairwise path-selector CE weight")
     p_train.add_argument("--block-ce-weight", type=float, default=None,
                          help="hard block-CE auxiliary in the distill stage")
+    p_train.add_argument("--teacher-http", default=None,
+                         help="served /v1 endpoint for live teacher signals")
+    p_train.add_argument("--teacher-key", default=None)
+    p_train.add_argument("--teacher-model", default=None)
     p_train.add_argument("--transfer-space", default=None,
                          help="DSpine transfer-space .pt (C, R_init, rank)")
     p_train.add_argument("--transfer-gamma", type=float, default=None)
@@ -226,7 +231,17 @@ def _cmd_train(args: argparse.Namespace) -> int:
     n_taps = len((tspec.get("state_taps") or [6, 14, 22, 30, 38, 48]))
     teacher = None
     teacher_dim = 0
-    if args.stage == "distill":
+    if getattr(args, "teacher_http", None):
+        # Live logits teacher over the served recipe (Stages 2/5/6).
+        from .teacher.http import HTTPTeacher
+        teacher = HTTPTeacher(
+            args.teacher_http,
+            model=getattr(args, "teacher_model", None) or "flint",
+            api_key=(getattr(args, "teacher_key", None)
+                     or os.environ.get("VLLM_API_KEY", "")),
+            topk=int(tspec.get("topk_logits", 32)))
+        print(f"teacher: HTTP {args.teacher_http} ({teacher.model})", flush=True)
+    elif args.stage == "distill":
         d_tap = int(tspec.get("fixture_d_tap", 64))
         teacher = FixtureTeacher(cfg.vocab_size, d_tap=d_tap, n_taps=n_taps,
                                  topk=int(tspec.get("topk_logits", 32)))
