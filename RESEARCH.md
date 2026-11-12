@@ -468,6 +468,29 @@ INT8 checkpoints that match BF16 fidelity, including for draft models. ksdraft c
 use both: native INT8 training from scratch, PTQR-style exact-serving-kernel student
 + annealed dither + fidelity gates for final checkpoint production.
 
+### Implementation status (2026-11-12, §8 audit)
+- **The from-scratch full-INT8 decision is superseded by the user's explicit
+  directive**: train in fp16, then PTQR at int8 in the late stage. Current
+  regime: fp16 autocast with fp32 masters, fp16 checkpoints, fp32 gradients at
+  the optimizer handoff; no INT8 backward is used. The §8 open items (GS32->GS128
+  retile, master precision) are therefore out of scope for the live regime.
+- **PTQR (§8.1)** is implemented and aligned where the live setup allows:
+  - the student forward is the same int8 tier (`Int8Linear`/`KS3Int8Cell` ->
+    `w8a8_gemm`) that the serving proposer loads, i.e. an exact-tier student;
+  - geometric dither anneal to zero over 70% of the stage, then dither=0
+    consolidation; `ckpt_ptqr.pt` (tier=int8) and the int8 export are
+    byte-roundtrip stable;
+  - fidelity gate: quantized-vs-unquantized top-1 mismatch plus the
+    acceptance-delta probe; the acceptance arm is the served C12 witness
+    (`scripts/bench_flint_acceptance.py`), run manually.
+  - delta: the PTQR teacher is the deployed PTQR INT8 target's logprobs (HTTP),
+    not a frozen BF16 teacher with layer capture — the same hidden-state
+    blocker as Sections 1/4.
+- Float exceptions stay floating: selector codebooks, the transfer table, and
+  the spine/head write surfaces are not int8-converted; int8 covers the linear
+  projections, and Rosa's discrete-symbol surfaces keep the gate-before-
+  quantize rule (acceptance within +/-1pt).
+
 ---
 
 ## 9. Target model and draft sizing — DECIDED: Flint 40B/2.5A target, ~1B draft
