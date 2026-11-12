@@ -695,6 +695,32 @@ box (AMD RX 7900 XTX, 24 GB). Serving pauses during training sessions.
 7. First MI100 session (off-hours): load PTQR INT8 Flint in-process, validate the
    live-teacher path end-to-end, then scale training.
 
+### Implementation status (2026-11-12, §10 audit)
+- **Live in-process teacher: blocked.** Two attempts to construct `vllm.LLM`
+  in-process for the PTQR INT8 Flint failed: first a `ModelConfig` "model type
+  `flint` not recognized" validation error, then, with the config registry
+  imported first, `AttributeError: type object 'CacheConfig' has no attribute
+  'fields'` inside `create_engine_config`. The fork's engine construction works
+  through the API server path only, so the decided one-process teacher+draft
+  topology is not available.
+- **Workaround in use:** the served recipe is driven over HTTP
+  (`build_onpolicy_corpus.py`, `mine_teacher_http.py`), producing on-policy
+  tokens and top-k logprobs; the cache is static per mining pass. This loses the
+  draft-dependent supervision the section calls out (foresight/refine), which is
+  why those stages are marked blocked in Section 4.
+- **Hidden-state path, if the live teacher is required later:** the fork already
+  has an `extract_hidden_states` speculator that caches target hidden states for
+  an EAGLE-style draft (requires `eagle_aux_hidden_state_layer_ids`,
+  `num_speculative_tokens=1`). Exposing that buffer as a teacher side channel is
+  the concrete route to target-state conditioning without a working `LLM()`.
+- Memory math and the co-located topology were not exercised: serving and
+  mining run as one process, training as another with the server stopped.
+- Teacher-free workstreams: (1) Rosa Triton port done; (2) KS3 GS128 serving
+  kernels exist, the INT8-backward part is superseded by the fp16 directive;
+  (3) DSpine done; (4) 1B assembly done (995.3M, Section 9); (5) CE pretraining
+  done (phase A); (6) fixture teacher + hidden-state seam exist; (7) first MI100
+  live-teacher session blocked as above.
+
 ---
 
 ## 11. Training regime — DESIGNED 2026-11-08
