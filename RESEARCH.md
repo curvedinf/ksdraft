@@ -614,6 +614,20 @@ side-stream presence, per-layer allocation mix.
 references; at 1792D the budget arithmetic is exact but training behavior is
 what the MI100 runs will establish.
 
+**Implementation status (2026-11-12, §9 audit).** `configs/flint.yaml` had
+drifted to the pre-correction width (1536/512/5888, 741.6M core). It is now
+aligned to the decided shape: d=1792, 597 one-bit streams, 6,869 charts, 24
+layers, head_size 64, tied embeddings (`scripts/shape_report.py` reports a
+match). The derived assets were rebuilt at the new width: the target-SVD
+embedding (`runs/embedding_init.pt`, 150144x1792) and the DSpine transfer
+space/readout init (`runs/transfer_space.pt`, rank 256, R_init 256x1792).
+With the components added after the 2026-11-08 budget (empty payload, DSpine
+rank-256 injection, block conv, selector, LWR head) the model totals
+995,312,280 params (~0.995B), still inside the ~1B envelope and below the
+1.2-1.5B harness ceiling. Measured at B=128: 2205 tok/s, 18.8 GiB; B=256:
+2301 tok/s, 24.9 GiB (fits the 32 GB card). Checkpoints trained at the old
+1536 width (phaseA_20m, warmup_flint*) are superseded by this shape change.
+
 ---
 
 ## 10. Training execution — DECIDED: live INT8 teacher on MI100; teacher-free development

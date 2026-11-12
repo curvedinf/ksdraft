@@ -23,11 +23,11 @@ teacher:
 
 draft:                        # RESEARCH.md Section 9, decided shape
   layers: 24
-  d_model: 1536
+  d_model: 1792
   head_size: 64
-  rosa_streams: 512
+  rosa_streams: 597
   rosa_bits: 1
-  ks3_charts: 5888
+  ks3_charts: 6869
   block_len: 16
   anchor_stride: 64
   dtype: int8                 # int8 | bf16 | fp32
