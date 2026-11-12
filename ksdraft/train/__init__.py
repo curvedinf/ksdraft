@@ -57,6 +57,10 @@ class TrainConfig:
     # Block objective position weighting (EAGLE-4 0.8^i shape): offsets that
     # survive verification early dominate acceptance length.
     block_position_decay: float = 1.0
+    # DFlash-standard block objective: forward KL(full target -> draft) on the
+    # block offsets, position-weighted. This is the primary loss for the
+    # served proposal surface; block_weight stays the hard-CE auxiliary.
+    block_kl_weight: float = 1.0
     # Schedule: "cosine" (reference) or "wsd" (warmup-stable-decay, the
     # speedrun-proven shape for longer runs / late annealing).
     lr_schedule: str = "cosine"
@@ -411,6 +415,24 @@ class Trainer:
                     None, self.cfg.head_chunk)
                 loss = loss + self.cfg.kl_weight * kl
                 parts["kl"] = float(kl.detach())
+                # Block-offset KL: the speculator proposes from offsets
+                # 0..bn-1 of the anchor; supervise each with the teacher
+                # distribution at that offset's true position, DFlash-style
+                # exponential position weights (normalized inside the loss).
+                anchor = self.cfg.seq_len - 1
+                if (self.cfg.block_kl_weight > 0 and bn > 0
+                        and anchor + bn <= ti.shape[1]):
+                    bw_off = block_position_weights(
+                        bn, self.cfg.block_position_decay, h.device)
+                    ids_off = torch.stack(
+                        [ti[:, anchor + j] for j in range(bn)], 1).reshape(-1, k)
+                    p_off = torch.stack(
+                        [tp[:, anchor + j] for j in range(bn)], 1).reshape(-1, k)
+                    w_off = bw_off.repeat(h.shape[0])
+                    bkl, _ = linear_soft_ce(hs.reshape(-1, d), w, ids_off,
+                                            p_off, w_off, self.cfg.head_chunk)
+                    loss = loss + self.cfg.block_kl_weight * bkl
+                    parts["block_kl"] = float(bkl.detach())
                 if self.cfg.wtv_weight > 0:
                     wtv = wtv_from_logp(topk_logp, tp.reshape(-1, k))
                     loss = loss + self.cfg.wtv_weight * wtv

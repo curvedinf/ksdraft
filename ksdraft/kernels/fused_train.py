@@ -150,7 +150,8 @@ class _LinearSoftCE(torch.autograd.Function):
                 dlog = dlog - gt.sum(-1, keepdim=True) * q
                 dlog.scatter_add_(-1, ids[s:e], gt)
             dlog_all[s:e] = dlog.to(x.dtype)
-            dw = dw + (dlog_all[s:e].t() @ x[s:e]).float()
+            if need_dw:
+                dw = dw + (dlog_all[s:e].t() @ x[s:e]).float()
         dx = _k_chunked_dx(dlog_all, wf)
         return dx, (dw.to(w.dtype) if need_dw else None), None, None, None, None
 

@@ -40,6 +40,13 @@ def main() -> int:
     ap.add_argument("--embedding-init", default=None)
     ap.add_argument("--freeze-embeddings", action="store_true")
     ap.add_argument("--chunk", type=int, default=512)
+    ap.add_argument("--block-n", type=int, default=4)
+    ap.add_argument("--block-kl", type=float, default=1.0,
+                    help="forward-KL weight on the block offsets (DFlash)")
+    ap.add_argument("--block-decay", type=float, default=0.8,
+                    help="DFlash fixed exponential position weights")
+    ap.add_argument("--block-ce", type=float, default=0.0,
+                    help="hard-CE auxiliary on the block offsets")
     args = ap.parse_args()
 
     from ksdraft.cli import _load_target_config
@@ -82,6 +89,7 @@ def main() -> int:
     except (RuntimeError, TypeError):
         opt = torch.optim.AdamW(params, lr=args.lr,
                                 weight_decay=0.01)
+    self_seq_len = min(16, windows.shape[1] - 1)
     g = torch.Generator().manual_seed(11)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -97,7 +105,8 @@ def main() -> int:
         w = windows[sel].to(dev)
         ids = topk_ids[sel].to(dev)
         probs = topk_probs[sel].to(dev)
-        from ksdraft.kernels.fused_train import (linear_ce, linear_soft_ce,
+        from ksdraft.kernels.fused_train import (block_position_weights,
+                                                 linear_ce, linear_soft_ce,
                                                  wtv_from_logp)
         amp = (torch.autocast("cuda", dtype=torch.float16)
                if args.device != "cpu" and args.train_dtype == "fp16"
@@ -117,6 +126,33 @@ def main() -> int:
         loss = ce + args.transfer * ts + args.kl * kl + args.wtv * wtv
         parts = {"ce": float(ce.detach()), "transfer": float(ts.detach()),
                  "kl": float(kl.detach()), "wtv": float(wtv.detach())}
+        # DFlash-standard block objective: the served proposal surface is
+        # anchor + block_delta[k]; supervise offset k against the teacher
+        # distribution at its true position, with exponential decay.
+        T = w.shape[1] - 1
+        ctx_len = min(self_seq_len, T)
+        anchor = ctx_len - 1
+        bn = min(args.block_n, T - anchor)
+        if bn > 0 and (args.block_kl > 0 or args.block_ce > 0):
+            hs = h[:, anchor].unsqueeze(1) + model.block_delta[:bn].unsqueeze(0)
+            ids_off = torch.stack(
+                [ids[:, anchor + j] for j in range(bn)], 1).reshape(-1, k)
+            p_off = torch.stack(
+                [probs[:, anchor + j] for j in range(bn)], 1).reshape(-1, k)
+            bw = block_position_weights(bn, args.block_decay, h.device)
+            w_off = bw.repeat(h.shape[0])
+            if args.block_kl > 0:
+                bkl, _ = linear_soft_ce(hs.reshape(-1, d), weight, ids_off,
+                                        p_off, w_off, args.chunk)
+                loss = loss + args.block_kl * bkl
+                parts["block_kl"] = float(bkl.detach())
+            if args.block_ce > 0:
+                tgt_off = torch.stack(
+                    [w[:, anchor + 1 + j] for j in range(bn)], 1).reshape(-1)
+                bce, _ = linear_ce(hs.reshape(-1, d), weight, tgt_off, w_off,
+                                   args.chunk)
+                loss = loss + args.block_ce * bce
+                parts["block_ce"] = float(bce.detach())
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -124,7 +160,8 @@ def main() -> int:
         if step % max(1, args.steps // 10) == 0 or step == args.steps - 1:
             el = time.time() - t0
             print(f"[distill {step:4d}] loss {loss.item():.4f} ce {parts['ce']:.4f} "
-                  f"kl {parts.get('kl', 0):.4f} wtv {parts.get('wtv', 0):.4f} "
+                  f"kl {parts.get('kl', 0):.4f} bkl {parts.get('block_kl', 0):.4f} "
+                  f"wtv {parts.get('wtv', 0):.4f} "
                   f"({args.batch * (step + 1) / max(1e-9, el):.0f} win/s)",
                   flush=True)
         if (step + 1) % args.save_every == 0 or step == args.steps - 1:
