@@ -56,11 +56,14 @@ class TrainConfig:
     block_only_steps: int = 0
     # Block objective position weighting (EAGLE-4 0.8^i shape): offsets that
     # survive verification early dominate acceptance length.
-    block_position_decay: float = 1.0
-    # DFlash-standard block objective: forward KL(full target -> draft) on the
+    block_position_decay: float = 0.8
+    # DFlash-standard block objective: forward KL(target -> draft) on the
     # block offsets, position-weighted. This is the primary loss for the
-    # served proposal surface; block_weight stays the hard-CE auxiliary.
+    # served proposal surface. In the distill stage the hard block CE drops
+    # to the block_ce_weight auxiliary (standard: CE is for hard-label/D-PACE
+    # only); block_weight stays the phase-A hard-CE primary.
     block_kl_weight: float = 1.0
+    block_ce_weight: float = 0.1
     # Schedule: "cosine" (reference) or "wsd" (warmup-stable-decay, the
     # speedrun-proven shape for longer runs / late annealing).
     lr_schedule: str = "cosine"
@@ -403,8 +406,12 @@ class Trainer:
                 bn, self.cfg.block_position_decay, h.device).repeat(h.shape[0])
             bce, _ = linear_ce(hs.reshape(-1, d), w, tgt.reshape(-1), bw,
                                self.cfg.head_chunk)
-            loss = ce + self.cfg.transfer_weight * ts \
-                + self.cfg.block_weight * bce
+            # Phase A (no teacher): hard block CE is the primary objective.
+            # With a teacher, the block forward KL below is primary and the
+            # hard CE is only the standard's hard-label auxiliary.
+            bw_ce = (self.cfg.block_ce_weight if tp is not None
+                     else self.cfg.block_weight)
+            loss = ce + self.cfg.transfer_weight * ts + bw_ce * bce
             parts = {"ce": float(ce.detach()),
                      "transfer": float(ts.detach()),
                      "block_ce": float(bce.detach())}

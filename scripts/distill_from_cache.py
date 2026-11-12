@@ -45,8 +45,9 @@ def main() -> int:
                     help="forward-KL weight on the block offsets (DFlash)")
     ap.add_argument("--block-decay", type=float, default=0.8,
                     help="DFlash fixed exponential position weights")
-    ap.add_argument("--block-ce", type=float, default=0.0,
-                    help="hard-CE auxiliary on the block offsets")
+    ap.add_argument("--block-ce", type=float, default=0.1,
+                    help="hard-CE auxiliary on the block offsets (standard: "
+                         "small, the forward KL is primary)")
     args = ap.parse_args()
 
     from ksdraft.cli import _load_target_config
