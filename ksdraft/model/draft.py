@@ -23,7 +23,7 @@ from ..config import KSDraftConfig
 from .block import DraftBlock
 from .blockconv import BlockConv
 from .selector import BlockSelector
-from .spine import SpineCore
+from .spine import AdjacentInjection, SpineCore
 
 
 class KSDraftModel(nn.Module):
@@ -49,13 +49,16 @@ class KSDraftModel(nn.Module):
                 "rank", C.shape[-1] if C is not None else cfg.d_model))
             # Inference rebuilds (export/load) carry the rank only; C is a
             # training-time table and is never used on the serving path.
-            C = C.float() if C is not None else None
+            # The transfer table is needed by last-write refinement at
+            # serving too, so it is a persistent fp16 buffer (77 MB).
+            C = (C.half() if C is not None
+                 else torch.zeros(cfg.vocab_size, rank, dtype=torch.float16))
         else:
             C = torch.nn.functional.normalize(
-                self.embedding.weight.detach().float(), dim=-1)
+                self.embedding.weight.detach().float(), dim=-1).half()
             R_init = None
             rank = cfg.d_model
-        self.register_buffer("transfer_C", C, persistent=False)
+        self.register_buffer("transfer_C", C, persistent=True)
         self.spine_core = SpineCore(rank)
         self.blocks = nn.ModuleList(
             [DraftBlock(cfg, layer, self.spine_core, rank, C, R_init)
@@ -73,6 +76,10 @@ class KSDraftModel(nn.Module):
         self.block_conv = BlockConv(cfg.d_model)
         # DFlash2 pairwise path selector over the block head's unary top-K.
         self.block_selector = BlockSelector(cfg.d_model, rank=256)
+        # DSpine last-write refinement at the block head: the same injection
+        # core, re-run with the decided predecessor token's transfer row.
+        self.head_write = AdjacentInjection(cfg.d_model, rank, self.spine_core,
+                                            C, R_init)
 
         if teacher_dim:
             self.teacher_proj = nn.Linear(teacher_dim, cfg.d_model, bias=False)
@@ -191,6 +198,38 @@ class KSDraftModel(nn.Module):
         target_idx = (ids == tgt[:, None]).float().argmax(-1)
         return torch.nn.functional.cross_entropy(scores, target_idx)
 
+    def lwr_loss(self, hs: torch.Tensor, tokens: torch.Tensor,
+                 anchor: int, bn: int, topk: int = 16) -> torch.Tensor:
+        """DSpine last-write refinement loss at the block head.
+
+        The offsets are re-written with the *correct* predecessor token
+        (teacher forcing), then scored only over each offset's unary top-K
+        candidates; the target replaces the weakest candidate when absent.
+        """
+        from ..kernels.fused_train import linear_topk
+
+        b, n, d = hs.shape
+        flat = hs.reshape(-1, d)
+        vals, ids = linear_topk(flat, self.head.weight, topk)
+        prev = torch.stack([tokens[:, anchor + j] for j in range(bn)],
+                           1).reshape(-1)
+        tgt = torch.stack([tokens[:, anchor + 1 + j] for j in range(bn)],
+                          1).reshape(-1)
+        h = self.head_write.block_write(hs, prev.view(b, n)).reshape(-1, d)
+        weight = self.head.weight
+        rows = weight[ids]                       # [N, K, d]
+        scores = (h.unsqueeze(1) * rows).sum(-1)
+        present = (ids == tgt[:, None]).any(-1)
+        label_ids = ids
+        if not bool(present.all()):
+            scores = scores.clone()
+            label_ids = ids.clone()              # keep `ids` intact for autograd
+            r = torch.arange(scores.shape[0], device=hs.device)
+            scores[r, -1] = (h * weight[tgt]).sum(-1)
+            label_ids[r, -1] = tgt
+        target_idx = (label_ids == tgt[:, None]).float().argmax(-1)
+        return torch.nn.functional.cross_entropy(scores, target_idx)
+
     @torch.no_grad()
     def propose_block_tokens(self, tokens: torch.Tensor, n: int,
                              topk: int = 16) -> torch.Tensor:
@@ -207,13 +246,14 @@ class KSDraftModel(nn.Module):
         vals, ids = linear_topk(hs.reshape(-1, d), self.head.weight, topk)
         vals = vals.view(b, nn_, topk)
         ids = ids.view(b, nn_, topk)
-        emb = self.embedding.weight
+        weight = self.head.weight
         prev = tokens[:, -1]
         out = []
         for j in range(nn_):
-            cand_emb = emb[ids[:, j]]
-            scores = self.block_selector.score_candidates(
-                hs[:, j], vals[:, j], cand_emb, emb[prev])
+            # last-write refinement with the decided predecessor token
+            h = self.head_write.block_write(hs[:, j:j + 1],
+                                            prev[:, None])[:, 0]
+            scores = (h.unsqueeze(1) * weight[ids[:, j]]).sum(-1)
             pick = scores.argmax(-1)
             tok = ids[:, j].gather(1, pick[:, None]).squeeze(1)
             out.append(tok)

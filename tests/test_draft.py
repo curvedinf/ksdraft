@@ -117,6 +117,8 @@ def test_full_shape_param_budget():
     # DSpine injection: per-layer R + W (rank 256), shared A/Gq/Gp/b
     spine_layer = 2 * 256 * d
     spine_core = 3 * 256 * 256 + 256
+    spine_head = 2 * 256 * d          # head last-write R + W
     assert counts["extras"] == (cfg.layers * spine_layer + spine_core
-                                + ln_params + block_head + conv + selector)
+                                + spine_head + ln_params + block_head + conv
+                                + selector)
     assert counts["total"] == counts["core"] + counts["extras"]

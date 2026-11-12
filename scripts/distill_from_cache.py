@@ -50,6 +50,8 @@ def main() -> int:
     ap.add_argument("--block-ce", type=float, default=0.1,
                     help="hard-CE auxiliary on the block offsets (standard: "
                          "small, the forward KL is primary)")
+    ap.add_argument("--lwr-weight", type=float, default=1.0,
+                    help="DSpine last-write-refinement CE weight")
     ap.add_argument("--selector-weight", type=float, default=1.0,
                     help="DFlash2 pairwise path-selector CE weight")
     ap.add_argument("--selector-topk", type=int, default=16)
@@ -178,6 +180,11 @@ def main() -> int:
                                           topk=args.selector_topk)
                 loss = loss + args.selector_weight * sel
                 parts["selector"] = float(sel.detach())
+            if args.lwr_weight > 0:
+                lwr = model.lwr_loss(hs, w, anchor, bn,
+                                     topk=args.selector_topk)
+                loss = loss + args.lwr_weight * lwr
+                parts["lwr"] = float(lwr.detach())
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -187,6 +194,7 @@ def main() -> int:
             print(f"[distill {step:4d}] loss {loss.item():.4f} ce {parts['ce']:.4f} "
                   f"kl {parts.get('kl', 0):.4f} bkl {parts.get('block_kl', 0):.4f} "
                   f"sel {parts.get('selector', 0):.4f} "
+                  f"lwr {parts.get('lwr', 0):.4f} "
                   f"wtv {parts.get('wtv', 0):.4f} "
                   f"({args.batch * (step + 1) / max(1e-9, el):.0f} win/s)",
                   flush=True)

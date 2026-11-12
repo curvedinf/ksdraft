@@ -68,6 +68,8 @@ class TrainConfig:
     # top-K, teacher-forcing the predecessor. Zero-init pair term, so the
     # objective starts equal to the unary argmax.
     selector_weight: float = 1.0
+    # DSpine last-write refinement CE at the block head (paper 4.3/4.5).
+    lwr_weight: float = 1.0
     # DSpine layer-wise embedding loss: cosine to the unified transfer space,
     # position decay w_i = exp(-(i)/gamma) (paper Eq. 6).
     transfer_gamma: float = 2.0
@@ -436,6 +438,10 @@ class Trainer:
                 sel = model.selector_loss(hs, tokens, self.cfg.seq_len - 1, bn)
                 loss = loss + self.cfg.selector_weight * sel
                 parts["selector"] = float(sel.detach())
+            if self.cfg.lwr_weight > 0:
+                lwr = model.lwr_loss(hs, tokens, self.cfg.seq_len - 1, bn)
+                loss = loss + self.cfg.lwr_weight * lwr
+                parts["lwr"] = float(lwr.detach())
             if tp is not None and self.cfg.kl_weight > 0:
                 k = tp.shape[-1]
                 kl, topk_logp = linear_soft_ce(

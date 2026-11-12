@@ -118,10 +118,16 @@ Researched 2026-11-08. No implementation has begun.
 - Already covered: block-causal attention direction (Rosa is causal), the
   DCOCO-style corrector (our DFlash2 selector: top-16 pair scores + greedy
   walk).
-- Still open: last-write refinement / transition cache (predecessor-token
-  re-write at the head), and DSpine's Eq. 7 distillation mix (α·CE +
-  (1-α)·L1) — we currently use block forward KL + small CE + WTV. γ is not
-  published in the fetched text (Appendix A), so 2.0 is our default.
+- Last-write refinement implemented at the block head: offsets are re-written
+  with the decided predecessor token's transfer row (`head_write.block_write`,
+  shared A/G/b, per-head R/W) and scored only over their unary top-16; the
+  training loss is teacher-forced K-way CE (weakest-candidate replacement for
+  out-of-set labels). Serving walks the offsets with per-offset rescoring —
+  the same result as the paper's K² transition cache for our n=3, without
+  precomputing the table.
+- Still open: DSpine's Eq. 7 distillation mix (α·CE + (1-α)·L1) — we use
+  block forward KL + small CE + WTV; γ is not published in the fetched text
+  (Appendix A), so 2.0 is our default.
 
 ---
 

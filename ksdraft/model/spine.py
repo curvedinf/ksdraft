@@ -67,6 +67,26 @@ class AdjacentInjection(nn.Module):
     def feature(self, h: torch.Tensor) -> torch.Tensor:
         return self.rank ** 0.5 * F.normalize(self.R(h), dim=-1)
 
+    def block_write(self, u: torch.Tensor,
+                    prev_tokens: torch.Tensor) -> torch.Tensor:
+        """Last-write refinement over block offsets (DSpine 4.3).
+
+        u [B, n, d] pre-write offset states; prev_tokens [B, n] holds the
+        *decided* predecessor token at each offset (the anchor token at
+        offset 0). A known token enters the transfer space directly as
+        sqrt(r) C_s, which changes both gate and message.
+        """
+        z = self.feature(u)
+        if self.C is None:
+            return u
+        tok = self.C[prev_tokens].to(u.dtype).float() * self.rank ** 0.5
+        z_prev = F.normalize(tok, dim=-1) * self.rank ** 0.5
+        core = self._core
+        g = torch.sigmoid(core.Gq(z) + core.Gp(z_prev) + core.b)
+        m = core.A(z_prev)
+        rms = u.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt()
+        return u + rms * self.W(g * m)
+
     def forward(self, u: torch.Tensor, prev_tokens: torch.Tensor | None = None,
                 sub_prob: float = 0.0):
         """u: (B, T, d) -> (post-injection h, transfer readout e)."""

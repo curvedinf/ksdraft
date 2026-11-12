@@ -63,3 +63,54 @@ def test_walk_returns_candidates():
     toks = m.propose_block_tokens(ctx, 4, topk=8)
     assert toks.shape == (2, 4)
     assert toks.min() >= 0 and toks.max() < cfg.vocab_size
+
+
+def test_lwr_identity_at_init_matches_unary_walk():
+    torch.manual_seed(4)
+    from ksdraft.config import KSDraftConfig
+    from ksdraft.model import KSDraftModel
+    cfg = KSDraftConfig(vocab_size=128, d_model=32, layers=2, head_size=16,
+                        rosa_streams=16, ks3_charts=64, block_len=8)
+    m = KSDraftModel(cfg).eval()
+    ctx = torch.randint(0, cfg.vocab_size, (2, 16))
+    # head_write.W / G_p are zero at init -> refinement is the identity and
+    # the walk must equal the unary argmax
+    blog = m.block_logits(ctx, 4).float()
+    walked = m.propose_block_tokens(ctx, 4, topk=8)
+    assert torch.equal(walked, blog.argmax(-1))
+
+
+def test_lwr_loss_finite_and_grads():
+    torch.manual_seed(5)
+    from ksdraft.config import KSDraftConfig
+    from ksdraft.model import KSDraftModel
+    cfg = KSDraftConfig(vocab_size=128, d_model=32, layers=2, head_size=16,
+                        rosa_streams=16, ks3_charts=64, block_len=8)
+    m = KSDraftModel(cfg)
+    with torch.no_grad():
+        m.head_write.W.weight.normal_(0, 0.05)
+        m.spine_core.Gp.weight.normal_(0, 0.05)
+    b, n, d = 3, 4, 32
+    hs = torch.randn(b, n, d, requires_grad=True)
+    tokens = torch.randint(0, cfg.vocab_size, (b, 20))
+    loss = m.lwr_loss(hs, tokens, 15, n, topk=8)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert hs.grad is not None
+    assert m.head_write.W.weight.grad is not None
+    assert m.head_write.R.weight.grad is not None
+
+
+def test_lwr_walk_returns_candidates():
+    torch.manual_seed(6)
+    from ksdraft.config import KSDraftConfig
+    from ksdraft.model import KSDraftModel
+    cfg = KSDraftConfig(vocab_size=128, d_model=32, layers=2, head_size=16,
+                        rosa_streams=16, ks3_charts=64, block_len=8)
+    m = KSDraftModel(cfg).eval()
+    with torch.no_grad():
+        m.head_write.W.weight.normal_(0, 0.05)
+    ctx = torch.randint(0, cfg.vocab_size, (2, 16))
+    tok = m.propose_block_tokens(ctx, 4, topk=8)
+    assert tok.shape == (2, 4)
+    assert tok.min() >= 0 and tok.max() < cfg.vocab_size
