@@ -15,7 +15,10 @@ Optimization per Section 11: AdamW, cosine schedule with warmup, peak LR
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +71,13 @@ class TrainConfig:
     muon_weight_decay: float = 0.01
     # Chunk size for the low-memory head losses.
     head_chunk: int = 128
+    # Rolling resume checkpoint + held-out metrics. The checkpoint is
+    # written atomically to ckpt_latest.pt every roll_every_sec; the eval
+    # cache is a mined teacher cache over held-out windows (KLD + EAL proxy).
+    roll_every_sec: float = 300.0
+    eval_cache: str | None = None
+    eval_windows: int = 512
+    eval_batch: int = 32
     # Micro-batches per optimizer step: raises the effective batch without
     # the activation memory of a single large batch (tok/s is unchanged).
     grad_accum: int = 1
@@ -239,6 +249,16 @@ class Trainer:
         if cfg.ema_decay > 0:
             self.ema = {name: p.detach().clone()
                         for name, p in self.model.named_parameters()}
+        self._eval_tensors = None
+        if cfg.eval_cache:
+            c = torch.load(cfg.eval_cache, map_location="cpu",
+                           weights_only=True)
+            n = int(c.get("filled", c["windows"].shape[0]))
+            self._eval_tensors = (c["windows"][:n].long(),
+                                  c["topk_ids"][:n].long(),
+                                  c["topk_probs"][:n].float())
+        self._t0 = time.time()
+        self._last_roll = self._t0
 
     def _lr_scale(self, step: int) -> float:
         c = self.cfg
@@ -320,6 +340,15 @@ class Trainer:
                         e.mul_(dcy).add_(prm.detach(), alpha=1.0 - dcy)
             rec = {"step": step, "loss": loss.item(), "grad_norm": float(gn), **parts}
             history.append(rec)
+            if (self.out_dir and self.cfg.roll_every_sec > 0
+                    and time.time() - self._last_roll >= self.cfg.roll_every_sec):
+                self.save_rolling(step)
+                metrics = self.held_out_eval()
+                self._log_metrics(step, rec, metrics)
+                log(f"[{stage} {step:4d}] roll@ {time.time() - self._t0:.0f}s "
+                    f"ce {rec['ce']:.4f} kld {metrics.get('kld', float('nan')):.4f} "
+                    f"eal {metrics.get('eal', float('nan')):.3f}", flush=True)
+                self._last_roll = time.time()
             if step % max(1, self.cfg.steps // 10) == 0 or step == self.cfg.steps - 1:
                 extra = (f" bce {parts['block_ce']:.4f}"
                          if "block_ce" in parts else "")
@@ -394,6 +423,72 @@ class Trainer:
             self.cfg.transfer_weight,
             self.cfg.kl_weight if use_teacher else 0.0,
             self.cfg.wtv_weight if use_teacher else 0.0)
+
+    def save_rolling(self, step: int):
+        """Atomic rolling resume checkpoint (model + optimizer + step)."""
+        dt = str(self.cfg.train_dtype).lower()
+        sd = self.model.state_dict()
+        if dt in ("fp16", "bf16"):
+            half = torch.float16 if dt == "fp16" else torch.bfloat16
+            sd = {k: v.to(half) for k, v in sd.items()}
+        tmp = self.out_dir / ".ckpt_latest.tmp"
+        torch.save({
+            "step": step,
+            "model": sd,
+            "optimizer": self.opt.state_dict(),
+            "optimizer_muon": (self.opt_muon.state_dict()
+                               if self.opt_muon is not None else None),
+            "train_cfg": vars(self.cfg),
+            "config": self.model.config.summary(),
+            "rolling": True,
+        }, tmp)
+        os.replace(tmp, self.out_dir / "ckpt_latest.pt")
+
+    @torch.no_grad()
+    def held_out_eval(self) -> dict:
+        """CE + KL(teacher support) + greedy EAL proxy on held-out windows."""
+        if self._eval_tensors is None:
+            return {}
+        w_all, ids_all, p_all = self._eval_tensors
+        n = min(self.cfg.eval_windows, w_all.shape[0])
+        w_all, ids_all, p_all = w_all[:n], ids_all[:n], p_all[:n]
+        was_training = self.model.training
+        self.model.eval()
+        ce_t = kld_t = eal_t = 0.0
+        for i in range(0, n, max(1, self.cfg.eval_batch)):
+            w = w_all[i:i + self.cfg.eval_batch].to(self.device)
+            ids = ids_all[i:i + self.cfg.eval_batch].to(self.device)
+            probs = p_all[i:i + self.cfg.eval_batch].to(self.device)
+            with self._amp():
+                logits, _ = self.model(w[:, :-1])
+            lg = logits.float()
+            tgt = w[:, 1:]
+            ce = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), tgt.reshape(-1))
+            p_t = probs / probs.sum(-1, keepdim=True).clamp_min(1e-9)
+            logp = F.log_softmax(lg, dim=-1)
+            on = logp.gather(-1, ids)
+            ent = -(p_t * p_t.clamp_min(1e-12).log()).sum(-1)
+            cross = -(p_t * on).sum(-1)
+            kld = (cross - ent).mean()
+            from .stages import expected_accepted_length
+            eal = expected_accepted_length(logits, w, probs, ids)
+            ce_t += float(ce)
+            kld_t += float(kld)
+            eal_t += float(eal)
+        chunks = max(1, math.ceil(n / max(1, self.cfg.eval_batch)))
+        if was_training:
+            self.model.train()
+        return {"ce": ce_t / chunks, "kld": kld_t / chunks,
+                "eal": eal_t / chunks}
+
+    def _log_metrics(self, step: int, rec: dict, metrics: dict):
+        if not self.out_dir:
+            return
+        row = {"step": step, "elapsed_s": round(time.time() - self._t0, 1),
+               "loss": rec.get("loss"), "ce": rec.get("ce"),
+               "block_ce": rec.get("block_ce"), **metrics}
+        with open(self.out_dir / "metrics.jsonl", "a") as f:
+            f.write(json.dumps(row) + "\n")
 
     def save(self, step: int):
         if not self.out_dir:

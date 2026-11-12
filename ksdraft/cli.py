@@ -72,6 +72,11 @@ def _build_parser() -> argparse.ArgumentParser:
                          help=".pt tensor [vocab, d_model] (target SVD projection)")
     p_train.add_argument("--freeze-embeddings", action="store_true",
                          default=None)
+    p_train.add_argument("--roll-every", type=float, default=None,
+                         help="seconds between rolling ckpt_latest.pt saves")
+    p_train.add_argument("--eval-cache", default=None,
+                         help="teacher cache over held-out windows")
+    p_train.add_argument("--eval-windows", type=int, default=None)
     p_train.add_argument("--boundary-sep", default=None,
                          help="comma-separated token ids marking a document "
                               "start (windows never cross one)")
@@ -252,6 +257,12 @@ def _cmd_train(args: argparse.Namespace) -> int:
         freeze_embeddings=(bool(args.freeze_embeddings)
                            if args.freeze_embeddings is not None
                            else TrainConfig.freeze_embeddings),
+        roll_every_sec=(args.roll_every if args.roll_every is not None
+                        else TrainConfig.roll_every_sec),
+        eval_cache=(args.eval_cache if args.eval_cache is not None
+                    else TrainConfig.eval_cache),
+        eval_windows=(args.eval_windows if args.eval_windows is not None
+                      else TrainConfig.eval_windows),
     )
     trainer = Trainer(model, teacher, sampler, tcfg, device=args.device,
                       out_dir=args.out)
