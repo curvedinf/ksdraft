@@ -1012,6 +1012,32 @@ adopted (user directive), with acceptance gates as the arbiter.
 
 ---
 
+## 12. Product & distribution goals — implementation status (2026-11-12)
+
+- `ksdraft size --propose` now codifies Section 9: given vocab and a core
+  budget it walks head-aligned widths with the family depth (24), streams
+  d/3 and charts d*368/96, and reports the draft/target active-FLOP ratio.
+  With Flint's facts (vocab 150144, 2.5B active) it reproduces the decided
+  shape exactly: d=1792, 597 streams, 6869 charts, 964,167,576 core, ratio
+  0.39 (the section's 1B/2.5B = 0.40).
+- `ksdraft mine` exists but only builds the dev corpus from docs/traces; the
+  live on-policy generation and teacher-top-k mining are standalone scripts
+  (`build_onpolicy_corpus.py`, `mine_teacher_http.py`), not CLI subcommands.
+- `ksdraft train`/`gate`/`export` exist. Export emits the int8 safetensors +
+  config payload the fork's speculator consumes; the HF-repo pattern
+  (checkpoint + modeling code + serving kit) and the SGLang/vLLM adapters are
+  not implemented.
+- Torch package API: `propose_block_tokens(tokens, n, topk)` returns tokens
+  (candidates/refinement are internal); the `target_states` argument is absent
+  because target-hidden conditioning is blocked (Sections 1/4/10). The dtype
+  tiers (int8/bf16/fp32) exist for export; one master checkpoint with derived
+  GS128 packs is the export model.
+- Section 8.2 lessons: small tables quantize with per-row scales, but our
+  selector codebook projections and the transfer table remain fp16 — recorded
+  float exceptions; PTQR retrains every surface it converts.
+
+---
+
 ## 13. Implementation status (2026-11-08)
 
 The training environment is built and MI100-ready (see MI100.md). Decision ->

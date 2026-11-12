@@ -25,6 +25,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_size = sub.add_parser("size", help="print the draft-shape parameter budget")
+    p_size.add_argument("--propose", action="store_true",
+                        help="propose a shape from target specs (Section 9)")
+    p_size.add_argument("--budget", type=float, default=1.0e9,
+                        help="core parameter budget for --propose")
+    p_size.add_argument("--target-active", type=float, default=2.5e9)
+    p_size.add_argument("--target-total", type=float, default=39.8e9)
     p_size.add_argument("--layers", type=int, default=KSDraftConfig.layers)
     p_size.add_argument("--d-model", type=int, default=KSDraftConfig.d_model)
     p_size.add_argument("--head-size", type=int, default=KSDraftConfig.head_size)
@@ -134,7 +140,46 @@ def _load_target_config(path: str) -> tuple[KSDraftConfig, dict, dict]:
     return cfg, spec.get("teacher") or {}, spec.get("training") or {}
 
 
+def _propose_shape(vocab: int, budget: float, layers: int = 24,
+                   head: int = 64) -> KSDraftConfig:
+    """RESEARCH Section 9 proposal: widest head-aligned d under the budget.
+
+    Depth stays at the family constant (24), streams track d/3, charts track
+    d*368/96, and the tied embedding (vocab x d) is part of the budget.
+    """
+    best = None
+    for d in range(head, 4097, head):
+        s = max(1, round(d / 3))
+        charts = max(1, round(d * 368 / 96))
+        c = KSDraftConfig(vocab_size=vocab, layers=layers, d_model=d,
+                          head_size=head, rosa_streams=s,
+                          ks3_charts=charts)
+        if c.total_params() <= budget:
+            best = c
+        else:
+            break
+    if best is None:
+        raise SystemExit("budget too small for the minimum shape")
+    return best
+
+
 def _cmd_size(args: argparse.Namespace) -> int:
+    if getattr(args, "propose", False):
+        cfg = _propose_shape(args.vocab, args.budget, layers=args.layers,
+                             head=args.head_size)
+        ratio = cfg.total_params() / max(1.0, args.target_active)
+        print(f"proposed shape for vocab={args.vocab:,}, "
+              f"budget={args.budget/1e9:.2f}B core")
+        print(f"  d_model {cfg.d_model}, layers {cfg.layers}, "
+              f"streams {cfg.rosa_streams}, charts {cfg.charts}")
+        print(f"  core {cfg.total_params():,} "
+              f"({cfg.total_params()/1e9:.3f}B)")
+        if args.target_active:
+            print(f"  draft/target active FLOP ratio: {ratio:.2f} "
+                  f"(Section 9 window ~0.2-0.5; 1B/2.5B = 0.40)")
+        print(f"  draft size vs target total: "
+              f"{cfg.total_params()/max(1.0, args.target_total)*100:.1f}%")
+        return 0
     cfg = KSDraftConfig(
         vocab_size=args.vocab,
         layers=args.layers,
