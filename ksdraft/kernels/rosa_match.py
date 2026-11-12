@@ -86,13 +86,20 @@ class _RosaMatch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, payload):
         B, T, S = q.shape
-        hard = torch.empty((B, T, S), device=q.device, dtype=q.dtype)
-        sign = torch.empty((B, S, T), device=q.device, dtype=torch.float32)
+        # tl.arange needs a power-of-two extent; zero-padding the time axis
+        # cannot change any t < T because matches only look strictly earlier.
+        Tp = 1 << (T - 1).bit_length()
+        if Tp != T:
+            pad = torch.zeros(B, Tp - T, S, device=q.device, dtype=q.dtype)
+            q, k, v = (torch.cat([t, pad], dim=1) for t in (q, k, v))
+        hard = torch.empty((B, Tp, S), device=q.device, dtype=q.dtype)
+        # the kernel indexes sign with the padded T
+        sign = torch.empty((B, S, Tp), device=q.device, dtype=torch.float32)
         grid = (B, triton.cdiv(S, BLOCK_S))
-        _match_kernel[grid](q, k, v, payload, hard, sign, S, T=T,
+        _match_kernel[grid](q, k, v, payload, hard, sign, S, T=Tp,
                             BS=BLOCK_S, num_warps=4)
-        ctx.save_for_backward(sign)
-        return hard
+        ctx.save_for_backward(sign[:, :, :T])
+        return hard[:, :T]
 
     @staticmethod
     def backward(ctx, dhard):

@@ -45,6 +45,10 @@ def main() -> int:
     ap.add_argument("--rank-oversample", type=int, default=32)
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--no-normalize", action="store_true",
+                    help="keep the raw projection scale (the default row-"
+                         "normalizes so the frozen tied head starts at "
+                         "cosine-scale logits)")
     args = ap.parse_args()
 
     target = Path(args.target)
@@ -60,6 +64,16 @@ def main() -> int:
     proj = u[:, :d] * s[:d]                    # [vocab, d] == E @ V_d
     del u, s, v, emb
     torch.cuda.empty_cache()
+    if not args.no_normalize:
+        # LayerNorm after the embedding removes the input-side scale, so the
+        # only effect of this constant is the tied head's logit scale. Unit
+        # rows keep token-pair cosines and start the frozen head at cosine-
+        # scale logits instead of the raw SVD magnitudes (CE 135 at step 0).
+        # Unit rows times 1/sqrt(d): the output LayerNorm has norm sqrt(d),
+        # so the tied-head logits start at standard-init scale (~1) instead
+        # of sqrt(d) * cosine (CE 30 at step 0).
+        proj = (torch.nn.functional.normalize(proj, dim=-1)
+                * (d ** -0.5))
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

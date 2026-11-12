@@ -446,40 +446,21 @@ class Trainer:
 
     @torch.no_grad()
     def held_out_eval(self) -> dict:
-        """CE + KL(teacher support) + greedy EAL proxy on held-out windows."""
         if self._eval_tensors is None:
             return {}
-        w_all, ids_all, p_all = self._eval_tensors
-        n = min(self.cfg.eval_windows, w_all.shape[0])
-        w_all, ids_all, p_all = w_all[:n], ids_all[:n], p_all[:n]
+        amp = (torch.autocast("cuda", dtype=torch.float16)
+               if self.device != "cpu" and str(self.cfg.train_dtype) == "fp16"
+               else torch.autocast("cuda", enabled=False))
         was_training = self.model.training
         self.model.eval()
-        ce_t = kld_t = eal_t = 0.0
-        for i in range(0, n, max(1, self.cfg.eval_batch)):
-            w = w_all[i:i + self.cfg.eval_batch].to(self.device)
-            ids = ids_all[i:i + self.cfg.eval_batch].to(self.device)
-            probs = p_all[i:i + self.cfg.eval_batch].to(self.device)
-            with self._amp():
-                logits, _ = self.model(w[:, :-1])
-            lg = logits.float()
-            tgt = w[:, 1:]
-            ce = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), tgt.reshape(-1))
-            p_t = probs / probs.sum(-1, keepdim=True).clamp_min(1e-9)
-            logp = F.log_softmax(lg, dim=-1)
-            on = logp.gather(-1, ids)
-            ent = -(p_t * p_t.clamp_min(1e-12).log()).sum(-1)
-            cross = -(p_t * on).sum(-1)
-            kld = (cross - ent).mean()
-            from .stages import expected_accepted_length
-            eal = expected_accepted_length(logits, w, probs, ids)
-            ce_t += float(ce)
-            kld_t += float(kld)
-            eal_t += float(eal)
-        chunks = max(1, math.ceil(n / max(1, self.cfg.eval_batch)))
+        out = held_out_metrics(
+            self.model, self._eval_tensors, block_n=int(self.cfg.block_n),
+            seq_len=int(self.cfg.seq_len), batch=self.cfg.eval_batch,
+            device=self.device, amp=amp,
+            limit=self.cfg.eval_windows)
         if was_training:
             self.model.train()
-        return {"ce": ce_t / chunks, "kld": kld_t / chunks,
-                "eal": eal_t / chunks}
+        return out
 
     def _log_metrics(self, step: int, rec: dict, metrics: dict):
         if not self.out_dir:
@@ -723,6 +704,82 @@ class Trainer:
             log(f"[ptqr] saved {self.out_dir / 'ckpt_ptqr.pt'}")
         return {"history": history, "quantized": quantized,
                 "fidelity": report, "final": history[-1], "initial": history[0]}
+
+
+@torch.no_grad()
+def held_out_metrics(model, tensors, block_n: int = 0, seq_len: int = 16,
+                     batch: int = 32, device="cuda", amp=None,
+                     limit: int | None = None) -> dict:
+    """Next-token CE/KLD/EAL plus per-draft-offset distributions.
+
+    ``tensors`` = (windows [N,T+1], teacher ids [N,T,K], teacher probs).
+    Direct metrics use the model's next-token head at every position.
+    Offset metrics run the parallel block head from an anchor at
+    ``seq_len-1`` and compare offset k's distribution with the teacher's
+    distribution at position ``seq_len-1+k`` — i.e. the distribution of the
+    token the speculator actually proposes at draft step k.
+    """
+    import torch.nn.functional as F
+
+    if amp is None:
+        amp = torch.autocast("cuda", enabled=False)
+    w_all, ids_all, p_all = tensors
+    n = w_all.shape[0] if limit is None else min(limit, w_all.shape[0])
+    w_all, ids_all, p_all = w_all[:n], ids_all[:n], p_all[:n]
+    ce_t = kld_t = eal_t = 0.0
+    chunks = 0
+    off_sum = [0.0] * max(0, block_n)
+    off_top = [0.0] * max(0, block_n)
+    off_cnt = 0
+    for i in range(0, n, max(1, batch)):
+        w = w_all[i:i + batch].to(device)
+        ids = ids_all[i:i + batch].to(device)
+        probs = p_all[i:i + batch].to(device)
+        with amp:
+            logits, _ = model(w[:, :-1])
+        lg = logits.float()
+        tgt = w[:, 1:]
+        ce = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), tgt.reshape(-1))
+        p_t = probs / probs.sum(-1, keepdim=True).clamp_min(1e-9)
+        logp = F.log_softmax(lg, dim=-1)
+        on = logp.gather(-1, ids)
+        ent = -(p_t * p_t.clamp_min(1e-12).log()).sum(-1)
+        kld = (-(p_t * on).sum(-1) - ent).mean()
+        from .stages import expected_accepted_length
+        eal = expected_accepted_length(logits, w, probs, ids)
+        ce_t += float(ce)
+        kld_t += float(kld)
+        eal_t += float(eal)
+        chunks += 1
+
+        if block_n > 0:
+            ctx_len = int(seq_len)
+            with amp:
+                _h, _f, hs = model.forward_block_hidden(w[:, :ctx_len], block_n)
+            weight = model.head.weight
+            for k in range(block_n):
+                tpos = ctx_len - 1 + k
+                if tpos >= ids.shape[1]:
+                    continue
+                with amp:
+                    lg_k = hs[:, k] @ weight.t()
+                lg_k = lg_k.float()
+                logq = F.log_softmax(lg_k, dim=-1)
+                ids_k = ids[:, tpos]
+                p_k = probs[:, tpos]
+                p_k = p_k / p_k.sum(-1, keepdim=True).clamp_min(1e-9)
+                on_k = logq.gather(-1, ids_k)
+                ent_k = -(p_k * p_k.clamp_min(1e-12).log()).sum(-1)
+                off_sum[k] += float((-(p_k * on_k).sum(-1) - ent_k).mean())
+                off_top[k] += float((lg_k.argmax(-1) == ids_k[:, 0]).float().mean())
+                off_cnt += 1
+    out = {"ce": ce_t / max(1, chunks), "kld": kld_t / max(1, chunks),
+           "eal": eal_t / max(1, chunks)}
+    if block_n > 0:
+        per_chunk = max(1, chunks)
+        out["kld_off"] = [x / per_chunk for x in off_sum]
+        out["top1_off"] = [x / per_chunk for x in off_top]
+    return out
 
 
 def transfer_alignment(features: list[torch.Tensor], embedding_weight: torch.Tensor,
