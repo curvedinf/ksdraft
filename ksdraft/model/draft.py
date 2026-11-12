@@ -47,8 +47,9 @@ class KSDraftModel(nn.Module):
             R_init = transfer_space.get("R_init")
             rank = int(transfer_space.get(
                 "rank", C.shape[-1] if C is not None else cfg.d_model))
-            C = (C.float() if C is not None
-                 else torch.zeros(cfg.vocab_size, rank))
+            # Inference rebuilds (export/load) carry the rank only; C is a
+            # training-time table and is never used on the serving path.
+            C = C.float() if C is not None else None
         else:
             C = torch.nn.functional.normalize(
                 self.embedding.weight.detach().float(), dim=-1)
