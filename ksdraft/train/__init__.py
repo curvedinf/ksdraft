@@ -436,8 +436,9 @@ class Trainer:
                     p_off = torch.stack(
                         [tp[:, anchor + j] for j in range(bn)], 1).reshape(-1, k)
                     w_off = bw_off.repeat(h.shape[0])
-                    bkl, _ = linear_soft_ce(hs.reshape(-1, d), w, ids_off,
-                                            p_off, w_off, self.cfg.head_chunk)
+                    bkl, _ = linear_soft_ce(
+                        hs.reshape(-1, d), w, ids_off, p_off, w_off,
+                        self.cfg.head_chunk, weight_norm="count")
                     loss = loss + self.cfg.block_kl_weight * bkl
                     parts["block_kl"] = float(bkl.detach())
                 if self.cfg.wtv_weight > 0:

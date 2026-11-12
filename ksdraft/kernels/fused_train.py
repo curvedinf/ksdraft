@@ -35,11 +35,20 @@ def _chunk_logits(x: torch.Tensor, w: torch.Tensor, chunk: int):
         yield s, e, x[s:e] @ w.t()
 
 
-def _weights(pos_weight: torch.Tensor | None, n: int,
-             device) -> torch.Tensor:
+def _weights(pos_weight: torch.Tensor | None, n: int, device,
+             norm: str = "sum") -> torch.Tensor:
+    """Per-position loss weights.
+
+    ``sum``  — weighted mean (divide by the weight sum; our original).
+    ``count``— Speculators' reference: multiply by the decay and divide by
+               the number of supervised positions, so decayed positions also
+               reduce the loss magnitude.
+    """
     if pos_weight is None:
         return torch.full((n,), 1.0 / n, device=device, dtype=torch.float32)
     w = pos_weight.float()
+    if norm == "count":
+        return w / max(1, n)
     return w / w.sum().clamp_min(1e-9)
 
 
@@ -62,10 +71,10 @@ def _k_chunked_dx(dlog: torch.Tensor, wf: torch.Tensor) -> torch.Tensor:
 
 class _LinearCE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w, targets, pos_weight, chunk):
+    def forward(ctx, x, w, targets, pos_weight, chunk, weight_norm="sum"):
         n, d = x.shape
         wf = w if w.dtype == x.dtype else w.to(x.dtype)
-        wgt = _weights(pos_weight, n, x.device)
+        wgt = _weights(pos_weight, n, x.device, weight_norm)
         loss = torch.zeros((), device=x.device, dtype=torch.float32)
         per_pos = torch.empty(n, device=x.device, dtype=torch.float32)
         for s, e, logits in _chunk_logits(x, wf, chunk):
@@ -100,7 +109,7 @@ class _LinearCE(torch.autograd.Function):
             if need_dw:
                 dw = dw + (dlog_all[s:e].t() @ x[s:e]).float()
         dx = _k_chunked_dx(dlog_all, wf)
-        return dx, (dw.to(w.dtype) if need_dw else None), None, None, None
+        return dx, (dw.to(w.dtype) if need_dw else None), None, None, None, None
 
 
 class _LinearSoftCE(torch.autograd.Function):
@@ -108,11 +117,11 @@ class _LinearSoftCE(torch.autograd.Function):
     log-probs on that support (for WTV / diagnostics)."""
 
     @staticmethod
-    def forward(ctx, x, w, ids, probs, pos_weight, chunk):
+    def forward(ctx, x, w, ids, probs, pos_weight, chunk, weight_norm="sum"):
         n, d = x.shape
         wf = w if w.dtype == x.dtype else w.to(x.dtype)
         k = ids.shape[1]
-        wgt = _weights(pos_weight, n, x.device)
+        wgt = _weights(pos_weight, n, x.device, weight_norm)
         p_t = probs.float()
         p_t = p_t / p_t.sum(-1, keepdim=True).clamp_min(1e-9)
         loss = torch.zeros((), device=x.device, dtype=torch.float32)
@@ -153,25 +162,28 @@ class _LinearSoftCE(torch.autograd.Function):
             if need_dw:
                 dw = dw + (dlog_all[s:e].t() @ x[s:e]).float()
         dx = _k_chunked_dx(dlog_all, wf)
-        return dx, (dw.to(w.dtype) if need_dw else None), None, None, None, None
+        return (dx, (dw.to(w.dtype) if need_dw else None), None, None, None,
+                None, None)
 
 
 def linear_ce(x: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor,
               pos_weight: torch.Tensor | None = None,
-              chunk: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
+              chunk: int = 64,
+              weight_norm: str = "sum") -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked next-token CE. Returns (loss, per-position CE)."""
-    return _LinearCE.apply(x, weight, targets, pos_weight, chunk)
+    return _LinearCE.apply(x, weight, targets, pos_weight, chunk, weight_norm)
 
 
 def linear_soft_ce(x: torch.Tensor, weight: torch.Tensor,
                    target_ids: torch.Tensor, target_probs: torch.Tensor,
                    pos_weight: torch.Tensor | None = None,
-                   chunk: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
+                   chunk: int = 64,
+                   weight_norm: str = "sum") -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked KL to a sparse top-k teacher target.
 
     Returns (loss, model log-probs on the teacher support)."""
     return _LinearSoftCE.apply(x, weight, target_ids, target_probs,
-                               pos_weight, chunk)
+                               pos_weight, chunk, weight_norm)
 
 
 def wtv_from_logp(topk_logp: torch.Tensor,
@@ -186,12 +198,18 @@ def wtv_from_logp(topk_logp: torch.Tensor,
     return 0.5 * (on_diff + off_mass).mean()
 
 
-def block_position_weights(n: int, decay: float, device) -> torch.Tensor:
-    """Normalized per-offset weights (EAGLE-4's 0.8^i shape, generalized).
+def block_position_weights(n: int, decay: float, device,
+                           mode: str = "decay") -> torch.Tensor:
+    """Per-offset weights for the block objective.
 
-    ``decay=1.0`` is the uniform objective; ``decay<1`` shifts supervision
-    toward the early offsets that dominate acceptance length."""
+    ``mode="decay"``: ``decay**k`` (Speculators' ``exp_loss_decay``; our
+    offsets start at the first draft token, so the anchor is already absent).
+    ``mode="gamma"``: ``exp(-k/gamma)`` (DFlash's ``dflash_loss_decay``
+    shape shifted past its zero-weight anchor position).
+    """
     if decay >= 1.0:
         return torch.ones(n, device=device)
-    i = torch.arange(n, device=device, dtype=torch.float32)
-    return decay ** i
+    k = torch.arange(n, device=device, dtype=torch.float32)
+    if mode == "gamma":
+        return torch.exp(-k / decay)
+    return decay ** k
