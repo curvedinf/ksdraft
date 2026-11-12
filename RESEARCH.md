@@ -1025,10 +1025,11 @@ adopted (user directive), with acceptance gates as the arbiter.
   `scripts/build_onpolicy_corpus.py` as the single implementation); the plain
   `mine` path still builds the dev corpus from docs/traces. Teacher top-k
   mining remains `scripts/mine_teacher_http.py`.
-- `ksdraft train`/`gate`/`export` exist. Export emits the int8 safetensors +
-  config payload the fork's speculator consumes; the HF-repo pattern
-  (checkpoint + modeling code + serving kit) and the SGLang/vLLM adapters are
-  not implemented.
+- `ksdraft train`/`gate`/`export` exist. Export writes the int8 safetensors +
+  config payload the fork's speculator consumes, plus a `modeling_ksdraft.py`
+  loader shim (`from_pretrained` / `load_draft`) implementing the HF-repo
+  pattern for consumers that have the package; SGLang/vLLM adapters are not
+  implemented (int8-vllm is the first-class target and is done).
 - Torch package API: `propose_block_tokens(tokens, n, topk)` returns tokens
   (candidates/refinement are internal); the `target_states` argument is absent
   because target-hidden conditioning is blocked (Sections 1/4/10). The dtype

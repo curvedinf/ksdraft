@@ -79,7 +79,13 @@ def export_model(model: KSDraftModel, out_dir: str,
     except ImportError:
         weights = out / "ksdraft.pt"
         torch.save(sd, weights)
+    # HF-repo pattern (RESEARCH Section 12): the checkpoint directory carries
+    # its own loader, so engines consume it without guessing.
+    (out / "modeling_ksdraft.py").write_text(LOADER_SHIM)
     return weights
+
+
+LOADER_SHIM = '# SPDX-License-Identifier: Apache-2.0\n"""Loader for a ksdraft draft repo (checkpoint + config + this shim).\n\n    from modeling_ksdraft import from_pretrained\n    draft = from_pretrained("path/to/repo", device="cuda")\n\nThe model class is the package\'s ksdraft.model.KSDraftModel; proposals\ngo through propose_block_tokens / block_logits (see ksdraft.export).\n"""\nfrom ksdraft.export import load_export\n\n\ndef from_pretrained(path, device="cpu"):\n    return load_export(str(path), device=device)\n\n\ndef load_draft(path, device="cpu"):\n    return load_export(str(path), device=device)\n'
 
 
 def load_export(out_dir: str, device: str = "cpu") -> KSDraftModel:

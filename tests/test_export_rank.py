@@ -25,3 +25,30 @@ def test_export_preserves_transfer_rank(tmp_path):
     with torch.no_grad():
         lg, _ = loaded(tok)
     assert torch.isfinite(lg).all()
+
+
+def test_hf_repo_loader_shim(tmp_path):
+    import importlib.util
+    import torch
+
+    from ksdraft.config import KSDraftConfig
+    from ksdraft.export import export_model, load_export
+    from ksdraft.model import KSDraftModel
+
+    cfg = KSDraftConfig(vocab_size=128, layers=2, d_model=32, head_size=16,
+                        rosa_streams=16, ks3_charts=64)
+    model = KSDraftModel(cfg, transfer_space={"C": torch.randn(128, 8),
+                                              "rank": 8}).eval()
+    out = tmp_path / "repo"
+    export_model(model, str(out))
+    shim = out / "modeling_ksdraft.py"
+    assert shim.exists()
+    spec = importlib.util.spec_from_file_location("_modeling_ksdraft", shim)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    draft = mod.from_pretrained(str(out))
+    assert draft.spine_core.rank == 8
+    tok = torch.randint(0, 128, (1, 16))
+    with torch.no_grad():
+        lg, _ = draft(tok)
+    assert torch.isfinite(lg).all()
