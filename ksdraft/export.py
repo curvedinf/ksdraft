@@ -93,7 +93,11 @@ def load_export(out_dir: str, device: str = "cpu") -> KSDraftModel:
         block_len=s.get("block_len", 16),
         dtype=s["dtype"], tie_word_embeddings=True,
     )
-    model = KSDraftModel(cfg, teacher_dim=meta.get("teacher_dim", 0))
+    ts_space = None
+    if meta.get("transfer_rank"):
+        ts_space = {"rank": int(meta["transfer_rank"])}
+    model = KSDraftModel(cfg, teacher_dim=meta.get("teacher_dim", 0),
+                         transfer_space=ts_space)
     st_path = out / "ksdraft.safetensors"
     if st_path.exists():
         from safetensors.torch import load_file
