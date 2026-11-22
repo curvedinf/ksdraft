@@ -69,10 +69,27 @@ class TargetKVAttention(nn.Module):
             raise ValueError("TargetKVAttention requires target KV "
                              "(k_src, v_src); pass target_kv through the model")
         B, T, _ = x.shape
-        W = k_src.shape[2]
         q = self.q_proj(x).view(B, T, self.n_q, self.head_size)
-        k = self.k_adapter(k_src).view(B, T, W, self.n_kv, self.head_size)
-        v = self.v_adapter(v_src).view(B, T, W, self.n_kv, self.head_size)
+        # per-layer contract (the trunk slices taps before calling):
+        # windows (B, T, W, kv_dim) — provider-aligned, dense; streams
+        # (B, S, kv_dim) — full causal streams, banded window inside
+        if k_src.dim() == 4:
+            return self._forward_windows(x, q, k_src, v_src)
+        if k_src.dim() == 3:
+            return self._forward_streams(x, q, k_src, v_src)
+        raise ValueError(f"target KV must be per-layer windows (B,T,W,D) "
+                         f"or streams (B,S,D); got {tuple(k_src.shape)}")
+
+    def _forward_windows(self, x, q, k_src, v_src):
+        """Dense provider-aligned per-layer windows (B, T, W, kv_dim) — the
+        test and fixture contract. Query t's window must contain only
+        positions <= t."""
+        B, T, W, _ = k_src.shape
+        # unified fp32 attention math: int8-tier projections return fp32 while
+        # adapter outputs follow the KV stream dtype (fp16 at serve time)
+        q = q.float()
+        k = self.k_adapter(k_src).view(B, T, W, self.n_kv, self.head_size).float()
+        v = self.v_adapter(v_src).view(B, T, W, self.n_kv, self.head_size).float()
         if self.n_kv != self.n_q:
             rep = self.n_q // self.n_kv
             k = k.repeat_interleave(rep, dim=3)
@@ -80,7 +97,52 @@ class TargetKVAttention(nn.Module):
         scores = torch.einsum("bthd,btwhd->bthw", q, k) / self.head_size ** 0.5
         p = scores.softmax(dim=-1)
         out = torch.einsum("bthw,btwhd->bthd", p, v)
-        return self.out_proj(out.reshape(B, T, self.n_q * self.head_size))
+        return self.out_proj(out.reshape(B, T, self.n_q * self.head_size).to(x.dtype))
+
+    def _forward_streams(self, x, q, k_src, v_src):
+        """Causal-window attention over a full per-layer KV stream (B, S, kv_dim).
+
+        The trunk's T tokens are the LAST T stream positions; query t (stream
+        index off+t, off = S-T) attends stream positions [off+t-W+1,
+        off+t] with W = S-T+1 — a banded mask over the full-stream scores.
+        This is the long-context path: memory scales with S, not T*W, so
+        W=1024 needs no per-query window materialization. Mathematically
+        identical to the windowed path (softmax over the same W entries).
+        """
+        B, S, _ = k_src.shape
+        T = x.shape[1]
+        if S < T:
+            raise ValueError(f"KV stream ({S}) shorter than the trunk "
+                             f"window ({T})")
+        W = S - T + 1
+        # unified fp32 attention math (see _forward_windows)
+        q = q.float()
+        k = self.k_adapter(k_src).view(B, S, self.n_kv, self.head_size).float()
+        v = self.v_adapter(v_src).view(B, S, self.n_kv, self.head_size).float()
+        g = self.n_q // self.n_kv
+        qg = q.view(B, T, self.n_kv, g, self.head_size)
+        # (B, T, nkv, g, S) — small even at S ~ 1k
+        scores = torch.einsum("btkgh,bskh->btkgs", qg, k) \
+            / self.head_size ** 0.5
+        mask = self._band_mask(T, S, W, x.device).view(1, T, 1, 1, S)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        p = scores.softmax(dim=-1)
+        out = torch.einsum("btkgs,bskh->btkgh", p, v)
+        out = out.reshape(B, T, self.n_q, self.head_size)
+        return self.out_proj(out.reshape(B, T, self.n_q * self.head_size).to(x.dtype))
+
+    _band_cache: dict = {}
+
+    def _band_mask(self, T: int, S: int, W: int, device) -> torch.Tensor:
+        key = (T, S, W, str(device))
+        m = self._band_cache.get(key)
+        if m is None:
+            off = S - T
+            q_pos = torch.arange(T, device=device)[:, None] + off
+            k_pos = torch.arange(S, device=device)[None, :]
+            m = (k_pos <= q_pos) & (k_pos > q_pos - W)
+            self._band_cache[key] = m
+        return m
 
 
 class ReuseBlock(nn.Module):

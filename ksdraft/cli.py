@@ -142,6 +142,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--kv-fixture", action="store_true", default=False,
                          help="teacherless stages: deterministic synthetic KV "
                               "provider (smoke/dev only, not a real teacher)")
+    p_train.add_argument("--kv-store", default=None,
+                         help="mined signal store (scripts/"
+                              "mine_inkling_signals.py): positioned KV "
+                              "streams + teacher top-k for training")
 
     p_gate = sub.add_parser("gate", help="run the dtype-tier parity battery")
     p_gate.add_argument("--config", default="configs/flint.yaml")
@@ -345,6 +349,11 @@ def _cmd_train(args: argparse.Namespace) -> int:
         if isinstance(ids, dict):
             bounds = ids.get("boundaries")
             ids = ids.get("tokens", ids.get("ids"))
+        if bounds is None:
+            sib = Path(str(args.corpus)).with_name("boundaries.pt")
+            if sib.exists():
+                bounds = torch.load(sib, map_location="cpu",
+                                    weights_only=True)
     else:
         ids = json.loads(Path(args.corpus).read_text())
     if args.boundary_sep:
@@ -353,6 +362,20 @@ def _cmd_train(args: argparse.Namespace) -> int:
         bounds = detect_boundaries(
             ids if isinstance(ids, torch.Tensor) else torch.tensor(ids), sep)
         print(f"boundaries: {bounds.numel()} documents", flush=True)
+    mined = None
+    if getattr(args, "kv_store", None):
+        from .teacher import MinedSignals
+        mined = MinedSignals(
+            args.kv_store,
+            window=int(getattr(args, "kv_window", None) or cfg.kv_window))
+        print(f"kv: mined store {args.kv_store} "
+              f"(W={mined.window}, positioned)", flush=True)
+        # sampling must stay inside the store's coverage
+        n_cov = int(mined.k.shape[0])
+        if len(ids) > n_cov:
+            ids = ids[:n_cov]
+            if bounds is not None:
+                bounds = bounds[bounds <= n_cov]
     sampler = WindowSampler(ids, seq_len=args.seq_len or 64, seed=11,
                             boundaries=bounds)
 
@@ -399,7 +422,9 @@ def _cmd_train(args: argparse.Namespace) -> int:
     model = KSDraftModel(cfg, teacher_dim=teacher_dim, embedding_init=emb_init,
                          head_init=head_init, transfer_space=ts_space)
     kv_provider = None
-    if cfg.kv_dim:
+    if mined is not None:
+        kv_provider = mined
+    elif cfg.kv_dim:
         print(f"reuse backbone: kv_dim={cfg.kv_dim} "
               f"({cfg.q_heads} q-heads <- {cfg.n_kv_eff} kv-heads, "
               f"W={cfg.kv_window})", flush=True)

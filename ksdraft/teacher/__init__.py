@@ -276,3 +276,6 @@ class HFTeacher(TeacherClient):
         probs = torch.softmax(logits, dim=-1)
         topk_p, topk_i = probs.topk(self.topk, dim=-1)
         return TeacherSignals(states, topk_i, topk_p.to(torch.float16))
+
+
+from .mined import MinedSignals  # noqa: E402,F401  (re-exported provider)

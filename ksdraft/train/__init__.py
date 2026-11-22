@@ -155,7 +155,8 @@ class WindowSampler:
     def _span(self, extra: int) -> int:
         return self.seq_len + 1 + extra
 
-    def batch(self, batch_size: int, extra: int = 0) -> torch.Tensor:
+    def batch(self, batch_size: int, extra: int = 0,
+              return_starts: bool = False):
         span = self._span(extra)
         if self.starts is None:
             idx = torch.randint(0, len(self.ids) - span, (batch_size,),
@@ -174,7 +175,8 @@ class WindowSampler:
             off = (torch.rand(batch_size, generator=self.g) * (max_off + 1)).long()
             idx = starts[pick] + off
         ar = torch.arange(span)
-        return self.ids[idx[:, None] + ar[None, :]]
+        window = self.ids[idx[:, None] + ar[None, :]]
+        return (window, idx) if return_starts else window
 
 
 def detect_boundaries(ids: torch.Tensor,
@@ -375,7 +377,9 @@ class Trainer:
                 prm.requires_grad_(name.startswith("block_delta"))
             print(f"[{stage}] block-head-only warmup for {block_only} steps",
                   flush=True)
-        use_teacher = stage == "distill" and self.teacher is not None
+        use_teacher = stage == "distill" and (self.teacher is not None
+                                              or hasattr(self.kv_provider,
+                                                         "signals_for_windows"))
         history = []
         accum = max(1, int(self.cfg.grad_accum))
         for step in range(self.cfg.steps):
@@ -448,13 +452,32 @@ class Trainer:
     def _micro_loss(self, bn: int, use_teacher: bool):
         """One micro-batch forward/loss (shared by every accumulation slot)."""
         model = self.model
+        positioned = hasattr(self.kv_provider, "signals_for_windows")
         batch = self.sampler.batch(
-            self.cfg.batch_size, extra=max(0, bn - 1)).to(self.device)
-        tokens = batch
+            self.cfg.batch_size, extra=max(0, bn - 1),
+            return_starts=positioned)
+        if positioned:
+            tokens, starts = batch
+            tokens = tokens.to(self.device)
+            starts = starts.to(self.device)
+        else:
+            tokens = batch.to(self.device)
+            starts = None
         states = None
         tp = ti = None
         kv = None
-        if use_teacher:
+        if positioned:
+            # mined store: positioned KV streams + top-k for THESE windows
+            sig = self.kv_provider.signals_for_windows(tokens[:, :-1], starts)
+            tp, ti = (sig.topk_probs, sig.topk_ids) if use_teacher \
+                else (None, None)
+            kv = sig.kv
+            kv_dtype = torch.float16 if self.device != "cpu" else torch.float32
+            kv = tuple(t.to(self.device, kv_dtype) for t in kv)
+            if tp is not None:
+                ti = ti.to(self.device)
+                tp = tp.to(self.device, kv_dtype)
+        elif use_teacher:
             sig = self.teacher.signals(tokens[:, :-1]).to(
                 self.device,
                 torch.float16 if self.device != "cpu" else torch.float32)
@@ -479,8 +502,17 @@ class Trainer:
             # block head); the block path only runs the first seq_len of them
             if states is not None and states.shape[1] > ctx.shape[1]:
                 states = states[:, :ctx.shape[1]]
-            if kv is not None and kv[0].shape[2] > ctx.shape[1]:
-                kv = tuple(t[:, :, :ctx.shape[1]] for t in kv)
+            if kv is not None:
+                if kv[0].dim() == 5 and kv[0].shape[2] > ctx.shape[1]:
+                    # window layout: drop the extra trailing positions
+                    kv = tuple(t[:, :, :ctx.shape[1]] for t in kv)
+                elif kv[0].dim() == 4:
+                    # stream layout: keep the span that ends at ctx's last
+                    # token (drop the block-head extra from the tail)
+                    extra_pos = tokens.shape[1] - 1 - ctx.shape[1]
+                    if extra_pos > 0:
+                        kv = tuple(t[:, :, :-extra_pos].contiguous()
+                                   for t in kv)
             with self._amp():
                 h, features, hs = model.forward_block_hidden(
                     ctx, bn, teacher_states=states, target_kv=kv,
