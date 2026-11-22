@@ -415,6 +415,8 @@ class Trainer:
             self.opt.step()
             if self.opt_muon is not None:
                 self.opt_muon.step()
+            from ..kernels.quant import bump_pack_epoch
+            bump_pack_epoch()
             if self.ema is not None:
                 with torch.no_grad():
                     dcy = self.cfg.ema_decay
@@ -460,6 +462,11 @@ class Trainer:
 
     def _micro_loss(self, bn: int, use_teacher: bool):
         """One micro-batch forward/loss (shared by every accumulation slot)."""
+        import os
+        if os.environ.get("KSDRAFT_PACK_PER_MICRO") == "1":
+            # verification switch: reproduce pre-cache per-micro-batch packs
+            from ..kernels.quant import bump_pack_epoch
+            bump_pack_epoch()
         model = self.model
         positioned = hasattr(self.kv_provider, "signals_for_windows")
         batch = self.sampler.batch(

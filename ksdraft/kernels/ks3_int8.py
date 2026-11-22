@@ -260,7 +260,20 @@ class KS3Int8Cell(nn.Module):
         return h.reshape(M, -1), coords
 
     @torch.no_grad()
+    def _masters_fingerprint(self):
+        return (self.master_down._version, self.master_up._version,
+                self.master_coefficients._version,
+                self.master_raw_scale._version, self.master_raw_shift._version)
+
     def _repack_masters(self):
+        # One pack per step (all micro-batches share it — bitwise lossless);
+        # a load/optimizer update changes either the epoch or the master
+        # versions and invalidates it.
+        from .quant import PACK_EPOCH
+        fp = (PACK_EPOCH, self._masters_fingerprint())
+        if getattr(self, "_packed_fp", None) == fp:
+            return
+        self._packed_fp = fp
         dq, ds = quantize_last_dim(self.master_down, self.group)
         uq, us = quantize_last_dim(self.master_up, self.group)
         sq, ss = pack_spine(self.master_coefficients, self.group)

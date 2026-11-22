@@ -74,13 +74,37 @@ class Int8Linear(nn.Module):
         self._dither = dither
         self._quantize_weight()
 
+    def _train_pack(self):
+        """Weight codes for the training forward, packed once per step.
+
+        Masters do not move between micro-batches, so the pack is a pure
+        function of the step epoch; reusing it is bitwise lossless and saves
+        one full repack per accumulation slot.
+        """
+        from .quant import PACK_EPOCH, quantize_last_dim
+
+        dither = float(getattr(self, "_dither", 0.0))
+        if dither > 0:
+            from ..train.stages import quantize_last_dim_dithered
+            c, s = quantize_last_dim_dithered(self.weight.detach().float(),
+                                              128, dither)
+            return c, s
+        ent = getattr(self, "_train_pack_cache", None)
+        if (ent is None or ent[0] != PACK_EPOCH
+                or ent[1].device != self.weight.device):
+            c, s = quantize_last_dim(self.weight.detach().float())
+            self._train_pack_cache = (PACK_EPOCH, c, s)
+            ent = self._train_pack_cache
+        return ent[1], ent[2]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if torch.is_grad_enabled() and self.weight.requires_grad:
             # training: real INT8 forward (INT8 operands, INT32 accumulate,
-            # fp32 epilogue); gradients hand off in fp32 through the STE
+            # fp32 epilogue); gradients hand off in fp32 through the STE.
+            # The weight pack is cached per step epoch (bitwise lossless).
+            w_codes, w_scales = self._train_pack()
             return _W8A8Linear.apply(
-                x, self.weight, self.bias,
-                float(getattr(self, "_dither", 0.0)))
+                x, self.weight, self.bias, w_codes, w_scales)
         self._maybe_quantize_weight()  # repacks only when masters changed
         x2 = x.reshape(-1, x.shape[-1])
         a_codes, a_scales = quantize_last_dim(x2.float())
@@ -97,7 +121,9 @@ class Int8Linear(nn.Module):
         Gradients (training) flow to the weight/bias through the STE.
         """
         if torch.is_grad_enabled() and self.weight.requires_grad:
-            return _W8A8LinearCodes.apply(codes, scales, self.weight, self.bias)
+            w_codes, w_scales = self._train_pack()
+            return _W8A8LinearCodes.apply(codes, scales, self.weight,
+                                          self.bias, w_codes, w_scales)
         self._maybe_quantize_weight()
         y = w8a8_gemm(codes.reshape(-1, codes.shape[-1]),
                       scales.reshape(-1, scales.shape[-1]).float(),
@@ -140,8 +166,7 @@ class _W8A8LinearCodes(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, codes, scales, w_master, bias):
-        w_codes, w_scales = quantize_last_dim(w_master.detach().float())
+    def forward(ctx, codes, scales, w_master, bias, w_codes, w_scales):
         y = w8a8_gemm(codes.reshape(-1, codes.shape[-1]),
                       scales.reshape(-1, scales.shape[-1]).float(),
                       w_codes, w_scales)
@@ -162,7 +187,7 @@ class _W8A8LinearCodes(torch.autograd.Function):
         g = grad_out.float().reshape(-1, grad_out.shape[-1])
         dw = g.t() @ xq
         db = g.sum(0) if ctx.has_bias else None
-        return None, None, dw, db
+        return None, None, dw, db, None, None, None
 
 
 class _W8A8Linear(torch.autograd.Function):
@@ -174,14 +199,8 @@ class _W8A8Linear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, w_master, bias, dither):
+    def forward(ctx, x, w_master, bias, w_codes, w_scales):
         x2 = x.reshape(-1, x.shape[-1]).float()
-        if dither > 0:
-            from ..train.stages import quantize_last_dim_dithered
-            w_codes, w_scales = quantize_last_dim_dithered(
-                w_master.detach().float(), 128, dither)
-        else:
-            w_codes, w_scales = quantize_last_dim(w_master.detach().float())
         a_codes, a_scales = quantize_last_dim(x2)
         y = w8a8_gemm(a_codes, a_scales, w_codes, w_scales)
         if bias is not None:
@@ -202,4 +221,4 @@ class _W8A8Linear(torch.autograd.Function):
         dx = (g @ w).reshape(ctx.in_shape)
         dw = g.t() @ xq
         db = g.sum(0) if ctx.has_bias else None
-        return dx, dw, db, None
+        return dx, dw, db, None, None, None

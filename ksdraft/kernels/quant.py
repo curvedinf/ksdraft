@@ -19,6 +19,17 @@ import torch
 
 GROUP_SIZE = 128
 SCALE_DTYPE = torch.float16
+
+# Training pack epoch: bumped after every optimizer step. Weight quantizers
+# (Int8Linear training forward, KS3Int8Cell masters, head-loss weight cache)
+# key their packed codes on this counter, so a step's micro-batches share one
+# pack (bitwise identical — masters do not move between micro-batches).
+PACK_EPOCH = 0
+
+
+def bump_pack_epoch() -> None:
+    global PACK_EPOCH
+    PACK_EPOCH += 1
 SCALE_MIN = 2.0**-24
 SCALE_MAX = 65504.0
 
