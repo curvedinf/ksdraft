@@ -149,3 +149,30 @@ def test_frozen_embedding_and_grad_accum(tmp_path):
     assert all(p.shape != (cfg.vocab_size, cfg.d_model)
                for g in tr.opt.param_groups for p in g["params"])
     assert res["final"]["loss"] == res["final"]["loss"]  # finite
+
+
+def test_resume_legacy_ks3_preserves_masters_and_adam_slots(tmp_path):
+    from ksdraft.model import to_int8
+
+    cfg = _tiny_model()
+    tc = TrainConfig(muon=False, adam8bit=True)
+    legacy = Trainer(KSDraftModel(cfg), None, None, tc, out_dir=tmp_path)
+    for index, p in enumerate(legacy.model.parameters(), 1):
+        p.grad = torch.full_like(p, index / 100)
+    legacy.opt.step()
+    legacy.save(1)
+    current = Trainer(to_int8(KSDraftModel(cfg), trainable_ks3=True),
+                      None, None, tc)
+    current.load(tmp_path / "ckpt_000001.pt")
+    for old, new in zip(legacy.model.blocks, current.model.blocks):
+        for source, master in [(old.ffn.down.weight, new.ffn.master_down),
+                               (old.ffn.up.weight, new.ffn.master_up),
+                               (old.ffn.coefficients, new.ffn.master_coefficients),
+                               (old.ffn.raw_scale, new.ffn.master_raw_scale),
+                               (old.ffn.raw_shift, new.ffn.master_raw_shift)]:
+            assert torch.equal(source.reshape_as(master), master)
+            for key in ("m_codes", "s_codes", "m_scales", "s_scales"):
+                before = legacy.opt.state[source][key]
+                after = current.opt.state[master][key]
+                assert before.dtype == after.dtype
+                assert torch.equal(before, after)

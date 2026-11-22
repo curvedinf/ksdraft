@@ -63,3 +63,31 @@ def test_cli_gate_and_export(tmp_path, capsys):
     assert main(["export", "--config", str(cfg_file),
                  "--out", str(tmp_path / "exp")]) == 0
     assert "exported ->" in capsys.readouterr().out
+
+
+def test_converted_checkpoint_exports_latest_master(tmp_path):
+    from types import SimpleNamespace
+
+    from safetensors.torch import load_file
+
+    from ksdraft.cli import _load_model
+    from ksdraft.model import to_int8
+
+    cfg_file = tmp_path / "tiny.yaml"
+    cfg_file.write_text(
+        "target: {vocab_size: 256}\ndraft: {layers: 2, d_model: 96, "
+        "head_size: 32, rosa_streams: 32, ks3_charts: 64}\n"
+    )
+    model = to_int8(KSDraftModel(_tiny_cfg()), trainable_ks3=True)
+    with torch.no_grad():
+        model.blocks[0].ffn.master_up.fill_(0.25)
+    checkpoint = tmp_path / "step.pt"
+    torch.save({"model": model.state_dict()}, checkpoint)
+    args = SimpleNamespace(config=cfg_file, checkpoint=checkpoint)
+    restored = _load_model(args)
+    assert torch.equal(restored.blocks[0].ffn.master_up, model.blocks[0].ffn.master_up)
+    packed = load_file(str(export_model(restored, str(tmp_path), dtype="int8")))
+    assert not any(".master_" in name for name in packed)
+    assert (packed["blocks.0.ffn.up_codes"] == 127).all()
+    assert torch.equal(load_export(str(tmp_path)).blocks[0].ffn.up_codes,
+                       packed["blocks.0.ffn.up_codes"])

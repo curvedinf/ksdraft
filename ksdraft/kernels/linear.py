@@ -54,7 +54,8 @@ class Int8Linear(nn.Module):
             codes, scales = quantize_last_dim(self.weight.detach().float())
         self.weight_codes = codes
         self.weight_scales = scales
-        self._codes_ver = self.weight._version
+        self._codes_ver = None if self.weight.is_inference() else self.weight._version
+        self._codes_dither = dither
 
     def _maybe_quantize_weight(self) -> None:
         """Re-quantize only when the fp32 masters changed.
@@ -64,12 +65,14 @@ class Int8Linear(nn.Module):
         check keeps codes live exactly while masters move.
         """
         if (self.weight_codes is None
-                or getattr(self, "_codes_ver", None) != self.weight._version):
+                or self.weight.is_inference()
+                or self._codes_ver != self.weight._version
+                or self._codes_dither != getattr(self, "_dither", 0.0)):
             self._quantize_weight()
 
     def _quantize_weight_dithered(self, dither: float) -> None:
         self._dither = dither
-        self._maybe_quantize_weight()
+        self._quantize_weight()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if torch.is_grad_enabled() and self.weight.requires_grad:

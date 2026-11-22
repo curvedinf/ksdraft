@@ -422,19 +422,6 @@ def _cmd_train(args: argparse.Namespace) -> int:
     model = KSDraftModel(cfg, teacher_dim=teacher_dim, embedding_init=emb_init,
                          head_init=head_init, transfer_space=ts_space)
     if str(cfg.dtype).lower() == "int8":
-        # int8 doctrine: training forward runs the INT8 tier (W8A8 GEMMs).
-        # Resume weights are loaded into the PLAIN module tree first: the
-        # tier conversion replaces KS3 cells (parameter names change), so a
-        # post-conversion load with strict=False would silently drop them.
-        if getattr(args, "resume", None):
-            ck = torch.load(args.resume, map_location="cpu",
-                            weights_only=False)
-            missing, _ = model.load_state_dict(ck["model"], strict=False)
-            if missing:
-                print(f"[resume] {len(missing)} missing (fresh): "
-                      f"{missing[:3]}", flush=True)
-            print(f"[resume] weights loaded into the plain tree before "
-                  f"int8 conversion (step {ck.get('step')})", flush=True)
         from .model import to_int8
         model = to_int8(model, trainable_ks3=True)
     kv_provider = None
@@ -521,6 +508,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
     if args.resume:
         ck = trainer.load(args.resume)
         print(f"resumed from {args.resume} (step {ck['step']})")
+        del ck
     res = trainer.train(stage=args.stage)
     print(f"final loss {res['final']['loss']:.4f} (initial {res['initial']['loss']:.4f})")
     return 0
@@ -538,7 +526,7 @@ def _load_model(args) -> "object":
     state = None
     tier = None
     if getattr(args, "checkpoint", None):
-        sd = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        sd = torch.load(args.checkpoint, map_location="cpu", mmap=True, weights_only=False)
         state = sd["model"] if "model" in sd else sd
         tier = sd.get("tier") if isinstance(sd, dict) else None
     # Teacher conditioning is a property of the checkpoint, not the recipe:
@@ -555,12 +543,15 @@ def _load_model(args) -> "object":
     if state is not None:
         # A PTQR checkpoint holds the converted module tree (KS3Int8Cell,
         # Int8Linear); the plain model's keys do not match it.
-        if tier == "int8" or any(k.endswith(".weight_codes") for k in state):
+        if tier == "int8" or "blocks.0.ffn.down_codes" in state:
             from .model import to_int8
-            model = to_int8(model)
-        missing, _ = model.load_state_dict(state, strict=False)
-        if missing:
-            print(f"[load] {len(missing)} new parameter(s) fresh: {missing[:3]}")
+            has_masters = "blocks.0.ffn.master_up" in state
+            model = to_int8(model, trainable_ks3=has_masters)
+            model.load_state_dict(state, strict=True)
+        else:
+            missing, _ = model.load_state_dict(state, strict=False)
+            if missing:
+                print(f"[load] {len(missing)} new parameter(s) fresh: {missing[:3]}")
     return model
 
 

@@ -25,6 +25,8 @@ autocast ``F.linear`` + ``F.cross_entropy``.
 
 from __future__ import annotations
 
+import weakref
+
 import torch
 
 
@@ -38,17 +40,27 @@ def _quantize_weight_cached(w: torch.Tensor):
     through here; caching keeps the 463M-parameter vocabulary head from being
     repacked on every proposal (and every backward recompute within a step).
     """
+    from .quant import GROUP_SIZE, quantize_last_dim
+
     key = id(w)
     ent = _WQ_CACHE.get(key)
-    ver = w._version
-    if ent is not None and ent[0] == ver and ent[3] is w:
-        return ent[1], ent[2]
-    from .quant import quantize_last_dim
+    version = None if w.is_inference() else w._version
+    if ent is not None and ent[0]() is w and ent[1] == version:
+        return ent[2], ent[3]
 
-    codes, scales = quantize_last_dim(w.detach().float())
-    if len(_WQ_CACHE) > 8:
-        _WQ_CACHE.clear()
-    _WQ_CACHE[key] = (ver, codes, scales, w)
+    # Bound temporary FP32 storage for the full-vocabulary projection.
+    rows, width = w.shape
+    codes = torch.empty_like(w, dtype=torch.int8, memory_format=torch.contiguous_format)
+    scales = w.new_empty((rows, (width + GROUP_SIZE - 1) // GROUP_SIZE),
+                         dtype=torch.float16)
+    for start in range(0, rows, 4096):
+        chunk = slice(start, start + 4096)
+        c, s = quantize_last_dim(w[chunk].detach().float())
+        codes[chunk].copy_(c)
+        scales[chunk].copy_(s)
+    if version is not None:
+        ref = weakref.ref(w, lambda _: _WQ_CACHE.pop(key, None))
+        _WQ_CACHE[key] = (ref, version, codes, scales)
     return codes, scales
 
 
@@ -137,7 +149,7 @@ class _LinearCE(torch.autograd.Function):
         # STE: the matmuls run on the quantize-dequantized operands (the
         # forward function's own values), gradients hand off in fp32
         xq = dequantize_last_dim(*quantize_last_dim(x.float()))
-        wq = dequantize_last_dim(*quantize_last_dim(wf.float()))
+        wq = dequantize_last_dim(*_quantize_weight_cached(wf))
         need_dw = getattr(ctx, "need_dw", True)
         dw = (torch.zeros(w.shape, device=w.device, dtype=torch.float32)
               if need_dw else None)
@@ -188,7 +200,7 @@ class _LinearSoftCE(torch.autograd.Function):
         from .quant import dequantize_last_dim, quantize_last_dim
 
         xq = dequantize_last_dim(*quantize_last_dim(x.float()))
-        wq = dequantize_last_dim(*quantize_last_dim(wf.float()))
+        wq = dequantize_last_dim(*_quantize_weight_cached(wf))
         need_dw = getattr(ctx, "need_dw", True)
         dw = (torch.zeros(w.shape, device=w.device, dtype=torch.float32)
               if need_dw else None)

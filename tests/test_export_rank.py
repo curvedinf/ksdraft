@@ -52,3 +52,15 @@ def test_hf_repo_loader_shim(tmp_path):
     with torch.no_grad():
         lg, _ = draft(tok)
     assert torch.isfinite(lg).all()
+
+
+def test_selector_reads_restored_table_after_dtype_move():
+    cfg = KSDraftConfig(vocab_size=128, layers=2, d_model=32, head_size=16,
+                        rosa_streams=16, ks3_charts=64)
+    model = KSDraftModel(cfg, transfer_space={"rank": 8}).double()
+    state = model.state_dict()
+    state["transfer_C"] = torch.randn_like(model.transfer_C)
+    model.load_state_dict(state)
+    for layer in [*(block.injection for block in model.blocks), model.head_write]:
+        assert layer.C is model.transfer_C
+    assert model.head.weight is model.embedding.weight

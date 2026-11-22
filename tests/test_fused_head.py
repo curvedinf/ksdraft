@@ -102,3 +102,22 @@ def test_hard_ce_fp16_gpu():
     ref = F.cross_entropy((_dq(x) @ _dq(w).t()).float(), t)
     out, _ = linear_ce(x, w, t, None, chunk=7)
     assert torch.allclose(out, ref, atol=2e-3)
+
+
+def test_weight_cache_tracks_updates_and_releases_dead_heads():
+    import gc
+    import weakref
+
+    from ksdraft.kernels.fused_train import _quantize_weight_cached, _WQ_CACHE
+
+    w = torch.ones(7, 64)
+    key = id(w)
+    ref = weakref.ref(w)
+    codes, _ = _quantize_weight_cached(w)
+    assert _quantize_weight_cached(w)[0] is codes
+    w.neg_()
+    updated, _ = _quantize_weight_cached(w)
+    assert torch.equal(updated, -codes)
+    del w
+    gc.collect()
+    assert ref() is None and key not in _WQ_CACHE

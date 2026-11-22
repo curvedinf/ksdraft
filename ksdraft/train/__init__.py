@@ -235,6 +235,11 @@ def distillation_losses(
     return loss, parts
 
 
+_KS3_MASTERS = {"down.weight": "down", "up.weight": "up",
+                "coefficients": "coefficients", "raw_scale": "raw_scale",
+                "raw_shift": "raw_shift"}
+
+
 class Trainer:
     def __init__(self, model: KSDraftModel, teacher: TeacherClient | None,
                  sampler: WindowSampler, cfg: TrainConfig,
@@ -377,8 +382,9 @@ class Trainer:
         model.train()
         block_only = int(self.cfg.block_only_steps) if self.cfg.block_n else 0
         if block_only:
+            trainable = [p for p in model.parameters() if p.requires_grad]
             for name, prm in model.named_parameters():
-                prm.requires_grad_(name.startswith("block_delta"))
+                prm.requires_grad_(prm.requires_grad and name.startswith("block_delta"))
             print(f"[{stage}] block-head-only warmup for {block_only} steps",
                   flush=True)
         use_teacher = stage == "distill" and (self.teacher is not None
@@ -393,18 +399,17 @@ class Trainer:
             self._step_sub_prob = self.cfg.spine_sub_prob * max(
                 0.0, 1.0 - step / max(1.0, 0.5 * self.cfg.steps))
             if block_only and step == block_only:
-                for prm in model.parameters():
+                for prm in trainable:
                     prm.requires_grad_(True)
                 print(f"[{stage}] backbone unfrozen at step {step}", flush=True)
             bn = int(self.cfg.block_n)
             self.opt.zero_grad(set_to_none=True)
             if self.opt_muon is not None:
                 self.opt_muon.zero_grad(set_to_none=True)
-            for micro in range(accum):
+            for _ in range(accum):
                 loss, parts = self._micro_loss(bn, use_teacher)
                 (loss / accum).backward()
-                if micro == accum - 1:
-                    break
+                last_loss = loss.detach()
                 del loss
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.grad_clip)
             self.opt.step()
@@ -416,7 +421,7 @@ class Trainer:
                     for name, prm in model.named_parameters():
                         e = self.ema[name]
                         e.mul_(dcy).add_(prm.detach(), alpha=1.0 - dcy)
-            rec = {"step": step, "loss": loss.item(), "grad_norm": float(gn), **parts}
+            rec = {"step": step, "loss": last_loss.item(), "grad_norm": float(gn), **parts}
             history.append(rec)
             if (self.out_dir and self.cfg.roll_every_sec > 0
                     and time.time() - self._last_roll >= self.cfg.roll_every_sec):
@@ -675,16 +680,77 @@ class Trainer:
                         "config": self.model.config.summary()},
                        self.out_dir / "ckpt_ema.pt")
 
+    def _migrate_optimizer_slots(self, ckpt, aliases):
+        # state_dict preserves the old parameter order, including KS3 matrices.
+        names = {}
+        for name, param in self.model.named_parameters():
+            for old, new in aliases.items():
+                suffix = ".ffn.master_" + new
+                if name.endswith(suffix):
+                    name = name.removesuffix(suffix) + ".ffn." + old
+                    break
+            names[id(param)] = name
+
+        for optimizer, key in ((self.opt, "optimizer"), (self.opt_muon, "optimizer_muon")):
+            saved = ckpt.get(key)
+            if optimizer is None or not saved:
+                continue
+            current = optimizer.state_dict()
+            slots = {names[id(param)]: slot for group, serialized in
+                     zip(optimizer.param_groups, current["param_groups"])
+                     for param, slot in zip(group["params"], serialized["params"])}
+            ordered = [name for name in ckpt["model"] if name in slots]
+            if len(saved["param_groups"]) == 2 and self.cfg.adam8bit and key == "optimizer":
+                def head(name):
+                    tensor = ckpt["model"][name]
+                    return tensor.ndim == 2 and tensor.shape[0] >= 4096
+                ordered.sort(key=lambda name: not head(name))
+            old_slots = [slot for group in saved["param_groups"] for slot in group["params"]]
+            if len(old_slots) != len(ordered):
+                raise ValueError(f"Cannot match legacy {key} slots to trainable weights")
+            current["state"] = {slots[name]: saved["state"][slot]
+                                for name, slot in zip(ordered, old_slots)
+                                if slot in saved["state"]}
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    moments = current["state"].get(slots[names[id(param)]], {})
+                    for moment in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                        if moment in moments:
+                            moments[moment] = moments[moment].reshape_as(param)
+            ckpt[key] = current
+
     def load(self, path, map_location=None):
-        ckpt = torch.load(path, map_location=map_location or self.device,
-                          weights_only=False)
-        # New surfaces (e.g. the parallel block head) start fresh when an
-        # older checkpoint predates them; everything else must match.
-        missing, _unexpected = self.model.load_state_dict(
-            ckpt["model"], strict=False)
-        if missing:
-            print(f"[load] {len(missing)} new parameter(s) initialized fresh: "
-                  f"{missing[:3]}", flush=True)
+        ckpt = torch.load(path, map_location=map_location or "cpu",
+                          mmap=True, weights_only=False)
+        state = ckpt["model"]
+        converted = getattr(self.model, "_int8_tier", None)
+        legacy = converted and "blocks.0.ffn.down.weight" in state
+        if legacy:
+            # Map the old float KS3 parameters directly into trainable masters.
+            # Packed buffers are derived data; rebuild them after loading.
+            state = dict(state)
+            for i, block in enumerate(self.model.blocks):
+                prefix = f"blocks.{i}.ffn."
+                for old, new in _KS3_MASTERS.items():
+                    master = "master_" + new
+                    state[prefix + master] = state.pop(prefix + old).reshape_as(
+                        getattr(block.ffn, master))
+            missing, unexpected = self.model.load_state_dict(state, strict=False)
+            derived = dict(self.model.named_buffers())
+            if unexpected or any(key not in derived for key in missing):
+                raise ValueError(f"Incompatible legacy checkpoint: {missing}, {unexpected}")
+            for block in self.model.blocks:
+                block.ffn._repack_masters()
+            # Old optimizer slots have positional IDs. KS3 conversion changes
+            # their order and moves coefficient tensors between Adam groups.
+            # Reconstruct their names from the original module registration order.
+            self._migrate_optimizer_slots(ckpt, _KS3_MASTERS)
+        elif converted:
+            self.model.load_state_dict(state, strict=True)
+        else:
+            missing, _ = self.model.load_state_dict(state, strict=False)
+            if missing:
+                print(f"[load] {len(missing)} new parameter(s) fresh: {missing[:3]}")
         if self.opt_muon is not None and ckpt.get("optimizer_muon"):
             try:
                 self.opt_muon.load_state_dict(ckpt["optimizer_muon"])
@@ -831,24 +897,62 @@ class Trainer:
         to zero on the INT8 tier (bit-identical to serving at dither=0), then
         run the fidelity gates against the unquantized drafter."""
         from ..model import to_int8
-        from .stages import fidelity_gate
+        from ..kernels.quant import dequantize_last_dim
+
+        # A converted training model already owns FP32 masters. Rebuild the
+        # independent pre-consolidation reference before changing them.
         ref = self.model.eval()
-        quantized = to_int8(self.model).train()
+        if getattr(ref, "_int8_tier", None):
+            ref = KSDraftModel(self.model.config, teacher_dim=self.model.teacher_dim,
+                               transfer_space={"rank": self.model.spine_core.rank})
+            src = self.model.state_dict()
+            state = {}
+            for key, tensor in ref.state_dict().items():
+                prefix, sep, suffix = key.partition(".ffn.")
+                source = (prefix + sep + "master_" + _KS3_MASTERS[suffix]
+                          if sep and suffix in _KS3_MASTERS else key)
+                state[key] = src[source].reshape_as(tensor)
+            ref.load_state_dict(state)
+            ref = ref.to(self.device).eval()
+
+        source = self._kv_source()
+        positioned = hasattr(source, "signals_for_windows")
+
+        def batch_inputs(size):
+            item = self.sampler.batch(size, return_starts=positioned)
+            batch, starts = item if positioned else (item, None)
+            batch = batch.to(self.device)
+            if positioned:
+                sig = source.signals_for_windows(batch[:, :-1], starts)
+            elif source is not None:
+                sig = source.signals(batch[:, :-1])
+            else:
+                sig = None
+            if sig is not None:
+                sig = sig.to(self.device, torch.float32)
+            if self.teacher and self.teacher is not source and not positioned:
+                teacher_sig = self.teacher.signals(batch[:, :-1]).to(self.device, torch.float32)
+                if sig is not None:
+                    teacher_sig.kv = sig.kv
+                sig = teacher_sig
+            return batch, sig
+
+        tokens_gate, gate_sig = batch_inputs(4)
+        gate_input = tokens_gate[:, :-1]
+        kv_gate = self._require_kv(gate_sig.kv if gate_sig else None, gate_input.shape)
+        ref_kv = kv_gate
+        if kv_gate is not None and len(kv_gate) == 4:
+            kc, ks, vc, vs = kv_gate
+            ref_kv = (dequantize_last_dim(kc, ks), dequantize_last_dim(vc, vs))
+        with torch.no_grad():
+            ref_ids = ref(gate_input, target_kv=ref_kv)[0].argmax(-1)
+        del ref, ref_kv
+        quantized = to_int8(self.model, trainable_ks3=True).train()
         qopt = torch.optim.AdamW(
             [p for p in quantized.parameters() if p.requires_grad],
             lr=self.cfg.peak_lr * 0.1)
         history = []
         anneal_steps = max(1, int(self.cfg.steps * anneal_frac))
-        tokens_gate = self.sampler.batch(4).to(self.device)
-        kv_gate = None
-        if self.model.config.kv_dim:
-            src = self._kv_source()
-            sig = src.signals(tokens_gate[:, :-1])
-            if sig.kv is None:
-                raise ValueError("KV source returned no kv for the PTQR gate")
-            # fp32: the gate runs outside autocast against the fp32 reference
-            kv_gate = tuple(t.to(self.device, dtype=torch.float32)
-                            for t in sig.kv)
         for m in quantized.modules():
             if hasattr(m, "_quantize_weight"):
                 m._dither = dither0
@@ -856,17 +960,14 @@ class Trainer:
             # Geometric anneal across the window, then dither=0 for the
             # remaining 30% so the tier consolidates on the exact serving grid.
             frac = min(1.0, step / anneal_steps)
-            dither = dither0 * (0.5 ** (20.0 * frac))
+            dither = dither0 * (0.5 ** (20.0 * frac)) if frac < 1.0 else 0.0
             for m in quantized.modules():
                 if hasattr(m, "_quantize_weight"):
                     m._dither = dither
-            batch = self.sampler.batch(self.cfg.batch_size).to(self.device)
-            flat, tp, ti, kv = self._teacher_batch(batch) if self.teacher else (None, None, None, None)
-            if self.kv_provider is not None and kv is None:
-                kv = self.kv_provider.signals(batch[:, :-1]).to(
-                    self.device,
-                    torch.float16 if self.device != "cpu" else torch.float32).kv
-            kv = self._require_kv(kv, batch[:, :-1].shape)
+            batch, sig = batch_inputs(self.cfg.batch_size)
+            flat = sig.states.flatten(2) if sig and sig.states is not None else None
+            tp, ti = (sig.topk_probs, sig.topk_ids) if sig and (self.teacher or positioned) else (None, None)
+            kv = self._require_kv(sig.kv if sig else None, batch[:, :-1].shape)
             logits, _ = quantized(batch[:, :-1], teacher_states=flat,
                                   target_kv=kv)
             ce = torch.nn.functional.cross_entropy(
@@ -885,13 +986,20 @@ class Trainer:
             history.append(rec)
             if step % max(1, self.cfg.steps // 5) == 0:
                 log(f"[ptqr {step:4d}] loss {rec['loss']:.4f} dither {dither:.4f}")
-        # fidelity gates (Section 8.1 battery)
-        def _acc(model, toks):
-            with torch.no_grad():
-                lg, _ = model(toks[:, :-1], target_kv=kv_gate)
-            return (lg.argmax(-1) == toks[:, 1:]).float().mean().item()
-        report = fidelity_gate(quantized.eval(), ref, tokens_gate,
-                               acceptance_delta_pt=1.0, _acceptance=_acc)
+        for m in quantized.modules():
+            if hasattr(m, "_quantize_weight"):
+                m._dither = 0.0
+        with torch.no_grad():
+            ids = quantized.eval()(gate_input, target_kv=kv_gate)[0].argmax(-1)
+        labels = tokens_gate[:, 1:]
+        # Teacher-forced agreement is a fraction; one percentage point is .01.
+        a_q = (ids == labels).float().mean().item()
+        a_r = (ref_ids == labels).float().mean().item()
+        mismatch = (ids != ref_ids).float().mean().item()
+        report = {"top1_mismatch": mismatch, "top1_pass": mismatch == 0,
+                  "acceptance_quantized": a_q, "acceptance_reference": a_r,
+                  "acceptance_pass": abs(a_q - a_r) <= 0.01}
+        report["all_pass"] = report["top1_pass"] and report["acceptance_pass"]
         log(f"[ptqr] fidelity: top1_mismatch={report['top1_mismatch']} "
             f"pass={report['all_pass']}")
         if self.out_dir:

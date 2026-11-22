@@ -118,6 +118,21 @@ class KSDraftModel(nn.Module):
             with torch.no_grad():
                 self.head.weight.copy_(head_init.to(self.head.weight.dtype))
 
+    def _apply(self, fn, recurse=True):
+        # All injection sites borrow the same checkpoint table. Moving each
+        # registered alias separately would duplicate it and make subsequent
+        # checkpoint loads invisible to the selectors.
+        borrowers = [block.injection for block in self.blocks] + [self.head_write]
+        for layer in borrowers:
+            layer.C = None
+        try:
+            return super()._apply(fn, recurse=recurse)
+        finally:
+            for layer in borrowers:
+                layer.C = self.transfer_C
+            if self.config.tie_word_embeddings:
+                self.head.weight = self.embedding.weight
+
     def trunk(self, tokens: torch.Tensor,
               teacher_states: torch.Tensor | None = None,
               target_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -285,7 +300,8 @@ class KSDraftModel(nn.Module):
     def propose_block_tokens(self, tokens: torch.Tensor, n: int,
                              topk: int = 16, return_conf: bool = False,
                              refine_iters: int = 0,
-                             target_kv: tuple[torch.Tensor, torch.Tensor] | None = None):
+                             target_kv: tuple[torch.Tensor, ...] | None = None,
+                             first_token: torch.Tensor | None = None):
         """Greedy selector walk over the block candidates (serving path).
 
         Starts from the last verified token and conditions each position on
@@ -312,10 +328,15 @@ class KSDraftModel(nn.Module):
                 scores = (h.unsqueeze(1) * weight[ids[:, j]]).sum(-1)
                 pick = scores.argmax(-1)
                 tok = ids[:, j].gather(1, pick[:, None]).squeeze(1)
+                if j == 0 and first_token is not None:
+                    tok = first_token
                 out.append(tok)
                 if return_conf:
                     p = torch.softmax(scores.float(), dim=-1)
-                    conf.append(p.gather(1, pick[:, None]).squeeze(1))
+                    if j == 0 and first_token is not None:
+                        conf.append((p * (ids[:, j] == tok[:, None])).sum(-1))
+                    else:
+                        conf.append(p.gather(1, pick[:, None]).squeeze(1))
                 prev = tok if forced is None else forced[:, j]
             return torch.stack(out, dim=1), (
                 torch.stack(conf, dim=1) if return_conf else None)

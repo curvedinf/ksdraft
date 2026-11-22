@@ -126,14 +126,15 @@ class TeacherSignals:
     topk_probs: torch.Tensor        # (B, T, k) fp16
     # DFly2-style target-KV reuse: (k, v), each (B, layers, T, W, kv_dim)
     # fp16 — one provider-aligned causal window tap per draft layer.
-    kv: tuple[torch.Tensor, torch.Tensor] | None = None
+    kv: tuple[torch.Tensor, ...] | None = None
 
     def to(self, device, dtype=torch.float16):
         return TeacherSignals(
             self.states.to(device=device, dtype=dtype) if self.states is not None else None,
             self.topk_ids.to(device),
             self.topk_probs.to(device=device, dtype=dtype),
-            kv=(tuple(t.to(device=device, dtype=dtype) for t in self.kv)
+            kv=(tuple(t.to(device=device, dtype=(dtype if t.is_floating_point() else t.dtype))
+                      for t in self.kv)
                 if self.kv is not None else None),
         )
 

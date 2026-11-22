@@ -114,10 +114,11 @@ class TargetKVAttention(nn.Module):
         qg = q.float().view(B, T, self.n_kv, g, self.head_size)
         qflat = qg.permute(0, 2, 1, 3, 4).reshape(
             B, self.n_kv, T * g, self.head_size)
-        qc, qs = quantize_last_dim(qflat, group=self.head_size)
+        group = max(32, 1 << (self.head_size - 1).bit_length())
+        qc, qs = quantize_last_dim(qflat, group=group)
         kc, ks = quantize_last_dim(
             k.permute(0, 2, 1, 3).reshape(-1, self.head_size),
-            group=self.head_size)
+            group=group)
         kperm = k.permute(0, 2, 1, 3)
         kc = kc.view(B, self.n_kv, S, self.head_size)
         ks = ks.view(B, self.n_kv, S, 1)
@@ -127,15 +128,15 @@ class TargetKVAttention(nn.Module):
         for b in range(B):
             for h in range(self.n_kv):
                 s_i8 = w8a8_gemm(
-                    qc[b, h], qs[b, h], kc[b, h], ks[b, h])
+                    qc[b, h], qs[b, h], kc[b, h], ks[b, h], group=group)
                 if torch.is_grad_enabled():
                     # STE: the value is the int8 GEMM; the gradient flows
                     # through the dequantized operands (identity quantizer)
                     q_dq = dequantize_last_dim(
-                        qc[b, h].float(), qs[b, h]) + (
+                        qc[b, h], qs[b, h].detach(), group=group) + (
                             qflat[b, h] - qflat[b, h].detach())
                     k_dq = dequantize_last_dim(
-                        kc[b, h].float(), ks[b, h]) + (
+                        kc[b, h], ks[b, h].detach(), group=group) + (
                             kperm[b, h] - kperm[b, h].detach())
                     s_ste = q_dq @ k_dq.t()
                     s_i8 = s_i8.detach() + (s_ste - s_ste.detach())

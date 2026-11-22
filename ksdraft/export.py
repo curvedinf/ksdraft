@@ -57,6 +57,7 @@ def export_model(model: KSDraftModel, out_dir: str,
     (out / "config.json").write_text(json.dumps(meta, indent=2))
 
     if dtype == "int8":
+        from .kernels.ks3_int8 import KS3Int8Cell
         from .kernels.linear import Int8Linear
         from .model import to_int8
 
@@ -64,7 +65,11 @@ def export_model(model: KSDraftModel, out_dir: str,
         sd = {}
         skip = set()
         for name, mod in model.named_modules():
+            if isinstance(mod, KS3Int8Cell) and mod.trainable:
+                mod._repack_masters()
+                skip.update(f"{name}.{key}" for key, _ in mod.named_parameters())
             if isinstance(mod, Int8Linear):
+                mod._quantize_weight()
                 sd[f"{name}.weight_codes"] = mod.weight_codes.detach().cpu().contiguous()
                 sd[f"{name}.weight_scales"] = mod.weight_scales.detach().cpu().float()
                 skip.add(f"{name}.weight")

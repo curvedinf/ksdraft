@@ -162,6 +162,16 @@ class AdamW8bit(Optimizer):
         # Legacy fp32 states (written by the plain AdamW) quantize on load;
         # v arrives as the second moment, storage wants its square root.
         for state in self.state.values():
+            # Optimizer.load_state_dict casts moment tensors to the parameter
+            # dtype. Restore the compact signed codes after device placement.
+            for key in ("m_codes", "s_codes"):
+                if key in state:
+                    state[key] = state[key].to(torch.int8)
+            if "exp_avg" in state:
+                state["m"] = state.pop("exp_avg")
+                state["v"] = state.pop("exp_avg_sq")
+                state.pop("max_exp_avg_sq", None)
+                state["step"] = int(state["step"])
             if "m" in state and state["m"].dtype.is_floating_point:
                 state["m_codes"], state["m_scales"] = quantize_state(
                     state.pop("m"), self.block_size)

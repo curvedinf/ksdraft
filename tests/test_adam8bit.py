@@ -177,3 +177,15 @@ def test_trainer_muon_and_adam8bit_on_gpu():
     log = io.StringIO()
     res = tr.train(stage="warmup", log=lambda m: print(m, file=log))
     assert res["final"]["loss"] == res["final"]["loss"]  # finite
+
+
+def test_resume_pytorch_adamw_state():
+    p = torch.nn.Parameter(torch.ones(16))
+    old = torch.optim.AdamW([p])
+    p.grad = torch.ones_like(p)
+    old.step()
+    opt = AdamW8bit([p])
+    opt.load_state_dict(old.state_dict())
+    assert opt.state[p]["m_codes"].dtype == torch.int8
+    opt.step()
+    assert opt.state[p]["step"] == 2

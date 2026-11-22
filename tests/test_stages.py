@@ -108,3 +108,28 @@ def test_fidelity_gate_detects_mismatch():
     assert report["top1_pass"] is False  # mismatch detected
     report_same = fidelity_gate(a, a, tokens)
     assert report_same["top1_pass"] is True
+
+
+def test_ptqr_converted_reuse_compares_clean_masters_with_positioned_int8_kv():
+    from ksdraft.kernels.quant import quantize_last_dim
+    from ksdraft.model import to_int8
+    from ksdraft.teacher import TeacherSignals
+
+    cfg = KSDraftConfig(vocab_size=128, layers=1, d_model=32, head_size=16,
+                        ks3_charts=32, kv_dim=128, n_kv_heads=1)
+
+    class Provider:
+        def signals_for_windows(self, tokens, starts):
+            assert starts.numel() == tokens.shape[0]
+            b, t = tokens.shape
+            codes, scales = quantize_last_dim(torch.randn(b, 1, t, 128))
+            return TeacherSignals(None, tokens.unsqueeze(-1),
+                                  torch.ones(b, t, 1), (codes, scales, codes, scales))
+
+    model = to_int8(KSDraftModel(cfg), trainable_ks3=True)
+    sampler = WindowSampler(torch.arange(1024) % 128, seq_len=4, seed=1)
+    trainer = Trainer(model, None, sampler, TrainConfig(steps=2, batch_size=2),
+                      kv_provider=Provider())
+    result = trainer.train("ptqr", log=lambda *_: None)
+    assert result["history"][-1]["dither"] == 0
+    assert 0 <= result["fidelity"]["top1_mismatch"] <= 1
