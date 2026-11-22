@@ -42,8 +42,12 @@ def parse_entry(entry, topk: int, serve_top_k: int, serve_top_p: float):
 class HTTPTeacher(TeacherClient):
     def __init__(self, base_url: str, model: str = "flint",
                  api_key: str = "", topk: int = 32,
-                 serve_top_p: float = 0.95, serve_top_k: int = 20,
+                 serve_top_p: float = 1.0, serve_top_k: int = 0,
                  timeout: float = 600.0):
+        # Serving-truncation defaults match the official Inkling-2-Mini
+        # contract (2026-11-22): temperature 1.0, no top-p/top-k truncation
+        # (generation_config.json; the model card itself states no
+        # recommendation). Pass explicit values if a recipe truncates.
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key

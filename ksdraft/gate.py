@@ -47,15 +47,30 @@ def run_gate(config: KSDraftConfig | None = None, device: str = "cpu",
     fresh = KSDraftModel(cfg, device=device).eval()
     x = torch.randn(2, 8, cfg.d_model, device=device)
     with torch.no_grad():
-        y, _ = fresh.blocks[0](x.clone())
+        if cfg.kv_dim:
+            # random KV windows; identity still holds because the attention's
+            # out projection is zero-initialized
+            kk = torch.randn(2, 8, 4, cfg.kv_dim, device=device)
+            y, _ = fresh.blocks[0](x.clone(), None, kk, kk.clone())
+        else:
+            y, _ = fresh.blocks[0](x.clone())
     ok = torch.allclose(y, x, atol=1e-5)
     checks["identity_block_init"] = {"pass": bool(ok), "detail": f"max dev {(y - x).abs().max().item():.2e}"}
 
     # 3. bf16 tier parity vs fp32
     tokens = torch.randint(0, min(cfg.vocab_size, 1000), (2, 16), device=device)
+    kv32 = None
+    if cfg.kv_dim:
+        g = torch.Generator().manual_seed(7)
+        kv32 = (torch.randn(2, cfg.layers, 16, 4, cfg.kv_dim, generator=g).to(device),
+                torch.randn(2, cfg.layers, 16, 4, cfg.kv_dim, generator=g).to(device))
     with torch.no_grad():
-        y32, _ = model(tokens)
-        ybf, _ = model.to(torch.bfloat16)(tokens)
+        y32, _ = model(tokens, target_kv=kv32)
+        bf = model.to(torch.bfloat16)
+        kvbf = (tuple(t.to(torch.bfloat16) for t in kv32) if kv32 is not None
+                else None)
+        ybf, _ = bf(tokens, target_kv=kvbf)
+    model.to(torch.float32)  # later checks (int8, finiteness) run in fp32
     rel = ((ybf.float() - y32.float()).norm() / y32.float().norm()).item()
     checks["bf16_parity"] = {"pass": rel < 0.05, "detail": f"rel {rel:.4f} (threshold 0.05)"}
 
@@ -84,7 +99,7 @@ def run_gate(config: KSDraftConfig | None = None, device: str = "cpu",
     try:
         from .model.int8_convert import to_int8
         with torch.no_grad():
-            y8, _ = to_int8(model)(tokens)
+            y8, _ = to_int8(model)(tokens, target_kv=kv32)
         rel8 = ((y8.float() - y32.float()).norm() / y32.float().norm()).item()
         checks["int8_model_parity"] = {
             "pass": rel8 < 0.15,
@@ -108,7 +123,7 @@ def run_gate(config: KSDraftConfig | None = None, device: str = "cpu",
 
     # 6. end-to-end finiteness
     with torch.no_grad():
-        logits, feats = model(tokens)
+        logits, feats = model(tokens, target_kv=kv32)
     finite = torch.isfinite(logits).all() and all(torch.isfinite(f).all() for f in feats)
     checks["forward_finite"] = {"pass": bool(finite), "detail": f"logits {tuple(logits.shape)}"}
 

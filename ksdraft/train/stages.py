@@ -119,11 +119,26 @@ def foresight_loss(pred_state, pred_token_logits, teacher_states, next_tokens):
 # ---------- stage 5: draft-forced refinement ----------
 
 @torch.no_grad()
-def greedy_continue(model, tokens: torch.Tensor, n_new: int) -> torch.Tensor:
-    """Append n_new greedy tokens from the model (draft-forced prefix)."""
+def greedy_continue(model, tokens: torch.Tensor, n_new: int,
+                    kv_source=None) -> torch.Tensor:
+    """Append n_new greedy tokens from the model (draft-forced prefix).
+
+    A reuse model (kv_dim > 0) needs ``kv_source`` — any teacher-client-like
+    object whose ``signals(tokens)`` returns kv — because each growing
+    continuation needs fresh target KV for its positions.
+    """
     cur = tokens
     for _ in range(n_new):
-        logits, _ = model(cur)
+        kv = None
+        if getattr(model.config, "kv_dim", 0):
+            if kv_source is None:
+                raise ValueError("draft-forced continuation for a reuse "
+                                 "model requires a KV source")
+            sig = kv_source.signals(cur)
+            if sig.kv is None:
+                raise ValueError("the continuation KV source returned no kv")
+            kv = sig.kv
+        logits, _ = model(cur, target_kv=kv)
         nxt = logits[:, -1].argmax(-1, keepdim=True)
         cur = torch.cat((cur, nxt), dim=1)
     return cur

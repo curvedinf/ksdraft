@@ -101,6 +101,13 @@ class KS3(nn.Module):
         return 0.5 * torch.tanh(self.raw_shift.float())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.subspace_rank == 1:
+            from ..kernels.ks3_wr import ks3_wr_forward, wr_enabled
+            if wr_enabled(x):
+                # WR fast path (2026-11-22): GS32 activation grids, in-kernel
+                # int8 coefficient grid, NL-mode Horner, fused VJP — the
+                # world-record lineage numerics, dense adaptation.
+                return ks3_wr_forward(x, self)
         coordinates = self.down(x)
         if self.subspace_rank == 1:
             from ..kernels.ks3_geom import ks3_geometry, triton_enabled

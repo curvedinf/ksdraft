@@ -88,11 +88,17 @@ class TrainConfig:
     # Tail weight averaging (speedrun #92): an EMA model is written next to
     # the final checkpoint; 0 disables.
     ema_decay: float = 0.0
-    # Split optimizer: Muon for the 2D hidden matrices, AdamW for embeddings,
-    # norms, biases and the structured tables (torch 2.11 built-in).
-    muon: bool = False
+    # Split optimizer (decided 2026-11-22): Muon for the 2D hidden matrices,
+    # AdamW for embeddings, norms, biases and the structured tables (torch
+    # built-in). On CPU the Muon arm is skipped (Newton-Schulz path is
+    # CUDA-only) and AdamW owns everything.
+    muon: bool = True
     muon_lr: float = 2e-3
     muon_weight_decay: float = 0.01
+    # Block-wise int8 Adam m/v states with fp32 math (decided 2026-11-22):
+    # ~3.9 GB -> ~1 GB of moments at the 0.48B reuse shape. Disable to
+    # resume the exact fp32-state regime.
+    adam8bit: bool = True
     # Chunk size for the low-memory head losses.
     head_chunk: int = 128
     # Rolling resume checkpoint + held-out metrics. The checkpoint is
@@ -230,17 +236,29 @@ def distillation_losses(
 class Trainer:
     def __init__(self, model: KSDraftModel, teacher: TeacherClient | None,
                  sampler: WindowSampler, cfg: TrainConfig,
-                 device: str = "cpu", out_dir: str | None = None):
+                 device: str = "cpu", out_dir: str | None = None,
+                 kv_provider: TeacherClient | None = None):
         self.model = model.to(device)
         self.teacher = teacher
+        self.kv_provider = kv_provider
         self.sampler = sampler
         self.cfg = cfg
         self.device = device
         self.out_dir = Path(out_dir) if out_dir else None
         if self.out_dir:
             self.out_dir.mkdir(parents=True, exist_ok=True)
+        if (model.config.kv_dim and teacher is None
+                and kv_provider is None):
+            raise ValueError(
+                "kv_dim > 0 (reuse backbone) needs a KV source: a fixture "
+                "distill teacher with kv_dim, a KV provider (--kv-fixture), "
+                "or any TeacherClient whose signals() returns kv")
         if cfg.freeze_embeddings:
             self.model.embedding.weight.requires_grad_(False)
+            if self.model.head.weight is not self.model.embedding.weight:
+                # untied DFly2 pattern: the head is the borrowed W4 target
+                # unembed — freeze it with the input table
+                self.model.head.weight.requires_grad_(False)
         self.opt_muon = None
         if cfg.muon and device != "cpu":
             muon_params, adam_params, muon_names = _split_muon(self.model)
@@ -259,16 +277,39 @@ class Trainer:
         else:
             adam_params = [p for p in self.model.parameters()
                            if p.requires_grad]
-        try:
-            # Fused AdamW: one kernel for the whole update (2.4x faster than
-            # foreach on this stack); falls back on backends without it.
-            self.opt = torch.optim.AdamW(
-                adam_params, lr=cfg.peak_lr,
-                weight_decay=cfg.weight_decay, fused=True)
-        except (RuntimeError, TypeError):
-            self.opt = torch.optim.AdamW(
-                adam_params, lr=cfg.peak_lr,
-                weight_decay=cfg.weight_decay)
+        if cfg.adam8bit:
+            from .adam8bit import AdamW8bit
+
+            # Reference param groups (modded-nanogpt): the vocab-sized
+            # head/embedding table gets its own betas (0.5, 0.95) and the
+            # head's wd_mul; everything else runs (0.9, 0.99) with no decay.
+            head, rest = [], []
+            for p in adam_params:
+                (head if p.ndim == 2 and p.shape[0] >= 4096 else rest).append(p)
+            groups = []
+            if head:
+                groups.append(dict(params=head, betas=(0.5, 0.95), wd_mul=150.0))
+            if rest:
+                groups.append(dict(params=rest, betas=(0.9, 0.99), wd_mul=0.0))
+            if not groups:
+                groups = [dict(params=[])]
+            self.opt = AdamW8bit(groups, lr=cfg.peak_lr,
+                                 weight_decay=cfg.weight_decay)
+            n_adam = sum(p.numel() for p in adam_params)
+            print(f"[opt] AdamW8bit (int8 m/sqrt(v), cautious lr^2 wd, "
+                  f"reference betas) on {n_adam:,} params "
+                  f"({len(head)} head tensors, {len(rest)} rest)", flush=True)
+        else:
+            try:
+                # Fused AdamW: one kernel for the whole update (2.4x faster than
+                # foreach on this stack); falls back on backends without it.
+                self.opt = torch.optim.AdamW(
+                    adam_params, lr=cfg.peak_lr,
+                    weight_decay=cfg.weight_decay, fused=True)
+            except (RuntimeError, TypeError):
+                self.opt = torch.optim.AdamW(
+                    adam_params, lr=cfg.peak_lr,
+                    weight_decay=cfg.weight_decay)
         self.ema = None
         if cfg.ema_decay > 0:
             self.ema = {name: p.detach().clone()
@@ -390,6 +431,20 @@ class Trainer:
         return {"history": history,
                 "final": history[-1], "initial": history[0]}
 
+    def _kv_source(self) -> TeacherClient | None:
+        """The KV-returning client for a reuse model (provider or teacher)."""
+        return self.kv_provider or self.teacher
+
+    def _require_kv(self, kv, tokens_shape) -> tuple[torch.Tensor, ...] | None:
+        if not self.model.config.kv_dim:
+            return None
+        if kv is None:
+            raise ValueError(
+                f"KV source returned no kv for tokens {tuple(tokens_shape)} "
+                "(e.g. the HTTP logprobs teacher); a reuse model cannot "
+                "forward without target KV")
+        return kv
+
     def _micro_loss(self, bn: int, use_teacher: bool):
         """One micro-batch forward/loss (shared by every accumulation slot)."""
         model = self.model
@@ -398,12 +453,19 @@ class Trainer:
         tokens = batch
         states = None
         tp = ti = None
+        kv = None
         if use_teacher:
             sig = self.teacher.signals(tokens[:, :-1]).to(
                 self.device,
                 torch.float16 if self.device != "cpu" else torch.float32)
             states = sig.states.flatten(2) if sig.states is not None else None
             tp, ti = sig.topk_probs, sig.topk_ids
+            kv = sig.kv
+        elif self.kv_provider is not None:
+            kv = self.kv_provider.signals(tokens[:, :-1]).to(
+                self.device,
+                torch.float16 if self.device != "cpu" else torch.float32).kv
+        kv = self._require_kv(kv, tokens[:, :-1].shape)
         if bn > 0:
             # Low-memory objective: chunked head losses, no V-sized logits
             # tensors (see kernels/fused_train.py). Teacher KL / WTV run on
@@ -413,9 +475,15 @@ class Trainer:
                                                wtv_from_logp)
             ctx = tokens[:, :self.cfg.seq_len]
             main_tokens = tokens[:, :self.cfg.seq_len + 1]
+            # teacher signals cover tokens[:, :-1] (seq_len + extra for the
+            # block head); the block path only runs the first seq_len of them
+            if states is not None and states.shape[1] > ctx.shape[1]:
+                states = states[:, :ctx.shape[1]]
+            if kv is not None and kv[0].shape[2] > ctx.shape[1]:
+                kv = tuple(t[:, :, :ctx.shape[1]] for t in kv)
             with self._amp():
                 h, features, hs = model.forward_block_hidden(
-                    ctx, bn, teacher_states=states,
+                    ctx, bn, teacher_states=states, target_kv=kv,
                     sub_prob=self._step_sub_prob)
             d = h.shape[-1]
             w = model.head.weight
@@ -448,8 +516,13 @@ class Trainer:
                 parts["lwr"] = float(lwr.detach())
             if tp is not None and self.cfg.kl_weight > 0:
                 k = tp.shape[-1]
+                # the main-path KL/WTV score the trunk's ctx positions;
+                # the block offsets below read the full signal span
+                n_ctx = h.shape[1]
+                ti_m = ti[:, :n_ctx].reshape(-1, k)
+                tp_m = tp[:, :n_ctx].reshape(-1, k)
                 kl, topk_logp = linear_soft_ce(
-                    h.reshape(-1, d), w, ti.reshape(-1, k), tp.reshape(-1, k),
+                    h.reshape(-1, d), w, ti_m, tp_m,
                     None, self.cfg.head_chunk)
                 loss = loss + self.cfg.kl_weight * kl
                 parts["kl"] = float(kl.detach())
@@ -477,12 +550,13 @@ class Trainer:
                         loss = loss + self.cfg.block_wtv_weight * bwtv
                         parts["block_wtv"] = float(bwtv.detach())
                 if self.cfg.wtv_weight > 0:
-                    wtv = wtv_from_logp(topk_logp, tp.reshape(-1, k))
+                    wtv = wtv_from_logp(topk_logp, tp_m)
                     loss = loss + self.cfg.wtv_weight * wtv
                     parts["wtv"] = float(wtv.detach())
             return loss, parts
         with self._amp():
-            logits, features = model(tokens[:, :-1], teacher_states=states)
+            logits, features = model(tokens[:, :-1], teacher_states=states,
+                                     target_kv=kv)
         return distillation_losses(
             logits, tokens, features, model.embedding.weight, tp, ti,
             self.cfg.transfer_weight,
@@ -522,7 +596,7 @@ class Trainer:
             self.model, self._eval_tensors, block_n=int(self.cfg.block_n),
             seq_len=int(self.cfg.seq_len), batch=self.cfg.eval_batch,
             device=self.device, amp=amp,
-            limit=self.cfg.eval_windows)
+            limit=self.cfg.eval_windows, teacher=self._kv_source())
         if was_training:
             self.model.train()
         return out
@@ -592,7 +666,8 @@ class Trainer:
         sig = self.teacher.signals(tokens[:, :-1]).to(
             self.device, torch.float16 if self.device != "cpu" else torch.float32)
         flat = sig.states.flatten(2) if sig.states is not None else None
-        return flat, sig.topk_probs, sig.topk_ids
+        kv = self._require_kv(sig.kv, tokens[:, :-1].shape)
+        return flat, sig.topk_probs, sig.topk_ids, kv
 
     def _train_foresight(self, log) -> dict:
         """Stage 4: drafter frozen; low-rank adapter predicts the target
@@ -614,8 +689,8 @@ class Trainer:
             with torch.no_grad():
                 # the trunk's final hidden state (features are now 256-d
                 # transfer readouts after the DSpine rewrite)
-                hidden, _ = self.model.trunk(batch[:, :-1])
-            flat, _, _ = self._teacher_batch(batch)
+                flat, _, _, kv = self._teacher_batch(batch)
+                hidden, _ = self.model.trunk(batch[:, :-1], target_kv=kv)
             pred_state, pred_logits = adapter(hidden.float())
             loss, parts = foresight_loss(
                 pred_state, pred_logits, flat, batch[:, 1:])
@@ -649,10 +724,12 @@ class Trainer:
             batch = self.sampler.batch(self.cfg.batch_size).to(self.device)
             T = batch.shape[1] - 1
             with torch.no_grad():
-                draft = greedy_continue(model, batch[:, : max(4, T - n_new)], n_new)
+                draft = greedy_continue(model, batch[:, : max(4, T - n_new)],
+                                        n_new, kv_source=self._kv_source())
             T_d = draft.shape[1] - 1
-            flat, tp, ti = self._teacher_batch(draft)
-            logits, features = model(draft[:, :-1], teacher_states=flat)
+            flat, tp, ti, kv = self._teacher_batch(draft)
+            logits, features = model(draft[:, :-1], teacher_states=flat,
+                                     target_kv=kv)
             mask = torch.zeros(T_d, dtype=torch.bool, device=self.device)
             mask[T_d - n_new:] = True
             inp, tgt = draft[:, :-1][:, mask], draft[:, 1:][:, mask]
@@ -689,8 +766,9 @@ class Trainer:
             self._step_sub_prob = self.cfg.spine_sub_prob * max(
                 0.0, 1.0 - step / max(1.0, 0.5 * self.cfg.steps))
             batch = self.sampler.batch(self.cfg.batch_size).to(self.device)
-            flat, tp, ti = self._teacher_batch(batch)
-            logits, features = model(batch[:, :-1], teacher_states=flat)
+            flat, tp, ti, kv = self._teacher_batch(batch)
+            logits, features = model(batch[:, :-1], teacher_states=flat,
+                                     target_kv=kv)
             wtv = wtv_loss(logits, tp, ti)
             ce = torch.nn.functional.cross_entropy(
                 logits.flatten(0, 1), batch[:, 1:].flatten())
@@ -723,6 +801,15 @@ class Trainer:
         history = []
         anneal_steps = max(1, int(self.cfg.steps * anneal_frac))
         tokens_gate = self.sampler.batch(4).to(self.device)
+        kv_gate = None
+        if self.model.config.kv_dim:
+            src = self._kv_source()
+            sig = src.signals(tokens_gate[:, :-1])
+            if sig.kv is None:
+                raise ValueError("KV source returned no kv for the PTQR gate")
+            # fp32: the gate runs outside autocast against the fp32 reference
+            kv_gate = tuple(t.to(self.device, dtype=torch.float32)
+                            for t in sig.kv)
         for m in quantized.modules():
             if hasattr(m, "_quantize_weight"):
                 m._dither = dither0
@@ -735,8 +822,14 @@ class Trainer:
                 if hasattr(m, "_quantize_weight"):
                     m._dither = dither
             batch = self.sampler.batch(self.cfg.batch_size).to(self.device)
-            flat, tp, ti = self._teacher_batch(batch) if self.teacher else (None, None, None)
-            logits, _ = quantized(batch[:, :-1], teacher_states=flat)
+            flat, tp, ti, kv = self._teacher_batch(batch) if self.teacher else (None, None, None, None)
+            if self.kv_provider is not None and kv is None:
+                kv = self.kv_provider.signals(batch[:, :-1]).to(
+                    self.device,
+                    torch.float16 if self.device != "cpu" else torch.float32).kv
+            kv = self._require_kv(kv, batch[:, :-1].shape)
+            logits, _ = quantized(batch[:, :-1], teacher_states=flat,
+                                  target_kv=kv)
             ce = torch.nn.functional.cross_entropy(
                 logits.flatten(0, 1), batch[:, 1:].flatten())
             loss = ce
@@ -756,7 +849,7 @@ class Trainer:
         # fidelity gates (Section 8.1 battery)
         def _acc(model, toks):
             with torch.no_grad():
-                lg, _ = model(toks[:, :-1])
+                lg, _ = model(toks[:, :-1], target_kv=kv_gate)
             return (lg.argmax(-1) == toks[:, 1:]).float().mean().item()
         report = fidelity_gate(quantized.eval(), ref, tokens_gate,
                                acceptance_delta_pt=1.0, _acceptance=_acc)
@@ -783,7 +876,8 @@ class Trainer:
 @torch.no_grad()
 def held_out_metrics(model, tensors, block_n: int = 0, seq_len: int = 16,
                      batch: int = 32, device="cuda", amp=None,
-                     limit: int | None = None) -> dict:
+                     limit: int | None = None,
+                     teacher: TeacherClient | None = None) -> dict:
     """Next-token CE/KLD/EAL plus per-draft-offset distributions.
 
     ``tensors`` = (windows [N,T+1], teacher ids [N,T,K], teacher probs).
@@ -792,6 +886,9 @@ def held_out_metrics(model, tensors, block_n: int = 0, seq_len: int = 16,
     ``seq_len-1`` and compare offset k's distribution with the teacher's
     distribution at position ``seq_len-1+k`` — i.e. the distribution of the
     token the speculator actually proposes at draft step k.
+
+    ``teacher`` is the KV source for reuse models (the eval cache carries
+    logprobs only); Rosa models never call it.
     """
     import torch.nn.functional as F
 
@@ -809,8 +906,17 @@ def held_out_metrics(model, tensors, block_n: int = 0, seq_len: int = 16,
         w = w_all[i:i + batch].to(device)
         ids = ids_all[i:i + batch].to(device)
         probs = p_all[i:i + batch].to(device)
+        kv = None
+        if getattr(model.config, "kv_dim", 0):
+            if teacher is None:
+                raise ValueError("held-out eval on a reuse model needs a KV "
+                                 "source (fixture/provider teacher)")
+            sig = teacher.signals(w[:, :-1])
+            if sig.kv is None:
+                raise ValueError("the eval KV source returned no kv")
+            kv = tuple(t.to(device) for t in sig.kv)
         with amp:
-            logits, _ = model(w[:, :-1])
+            logits, _ = model(w[:, :-1], target_kv=kv)
         lg = logits.float()
         tgt = w[:, 1:]
         ce = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), tgt.reshape(-1))
@@ -829,7 +935,9 @@ def held_out_metrics(model, tensors, block_n: int = 0, seq_len: int = 16,
         if block_n > 0:
             ctx_len = int(seq_len)
             with amp:
-                _h, _f, hs = model.forward_block_hidden(w[:, :ctx_len], block_n)
+                _h, _f, hs = model.forward_block_hidden(w[:, :ctx_len],
+                                                        block_n,
+                                                        target_kv=kv)
             weight = model.head.weight
             for k in range(block_n):
                 tpos = ctx_len - 1 + k

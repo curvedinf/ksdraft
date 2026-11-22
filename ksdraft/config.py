@@ -48,12 +48,25 @@ class KSDraftConfig:
     anchor_stride: int = 64
     dtype: Dtype = "int8"
     tie_word_embeddings: bool = True
+    # DFly2-style target-KV reuse: kv_dim > 0 replaces the Rosa mixer with
+    # cross-attention over target-provided KV (no drafter-side KV cache).
+    # kv_dim is the target's per-layer cached K/V width (Inkling-2-Mini:
+    # 8 KV heads x head_dim 128 = 1024).
+    kv_dim: int = 0
+    n_kv_heads: int = 8
+    kv_window: int = 1024
 
     def __post_init__(self) -> None:
         if self.dtype not in VALID_DTYPES:
             raise ValueError(f"dtype must be one of {VALID_DTYPES}, got {self.dtype!r}")
         if not 1 <= self.rosa_bits <= 64:
             raise ValueError("rosa_bits must be in [1, 64] (Rosa packed symbol width)")
+        if self.kv_dim < 0:
+            raise ValueError("kv_dim must be >= 0 (0 = Rosa backbone)")
+        if self.n_kv_heads < 1:
+            raise ValueError("n_kv_heads must be >= 1")
+        if self.kv_window < 1:
+            raise ValueError("kv_window must be >= 1")
 
     @property
     def n_heads(self) -> int:
@@ -66,6 +79,20 @@ class KSDraftConfig:
             return self.ks3_charts
         return round(self.d_model * KS3_CHARTS_PER_WIDTH)
 
+    # ---- reuse-attention head geometry (Section 9 Inkling 0.5B shape) ----
+
+    @property
+    def n_kv_eff(self) -> int:
+        # adapted KV heads, capped by the width's natural query-head count
+        return max(1, min(self.n_kv_heads, self.d_model // self.head_size))
+
+    @property
+    def q_heads(self) -> int:
+        # query heads rounded down to a whole number of KV groups (GQA)
+        base = max(1, self.d_model // self.head_size)
+        kv = self.n_kv_eff
+        return max(kv, (base // kv) * kv)
+
     # ---- per-layer core parameter counts (exact integers) ----
 
     def rosa_params(self) -> int:
@@ -75,12 +102,23 @@ class KSDraftConfig:
         d, s = self.d_model, self.rosa_streams
         return 4 * d * s + 4 * d + 5 * s
 
+    def reuse_attn_params(self) -> int:
+        # Q and output projections (d <-> q_heads*head_size), plus the K and V
+        # adapters from the target's cached KV width into the draft's KV heads
+        # (kv_dim -> n_kv_eff*head_size). No biases, no drafter-side KV cache.
+        q = self.q_heads * self.head_size
+        ko = self.n_kv_eff * self.head_size
+        return 2 * self.d_model * q + 2 * self.kv_dim * ko
+
+    def mixer_params(self) -> int:
+        return self.reuse_attn_params() if self.kv_dim else self.rosa_params()
+
     def ks3_params(self) -> int:
         d, c = self.d_model, self.charts
         return c * (2 * d + 6) + 2 * c
 
     def layer_params(self) -> int:
-        return self.rosa_params() + self.ks3_params()
+        return self.mixer_params() + self.ks3_params()
 
     def embedding_params(self) -> int:
         p = self.vocab_size * self.d_model
@@ -104,7 +142,13 @@ class KSDraftConfig:
             "block_len": self.block_len,
             "dtype": self.dtype,
             "tie_word_embeddings": self.tie_word_embeddings,
+            "kv_dim": self.kv_dim,
+            "n_kv_heads": self.n_kv_heads,
+            "kv_window": self.kv_window,
+            "q_heads": self.q_heads,
+            "mixer_params_per_layer": self.mixer_params(),
             "rosa_params_per_layer": self.rosa_params(),
+            "attn_params_per_layer": self.reuse_attn_params(),
             "ks3_params_per_layer": self.ks3_params(),
             "layer_params": self.layer_params(),
             "embedding_params": self.embedding_params(),

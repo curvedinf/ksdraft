@@ -12,7 +12,9 @@ Draft shape decided 2026-11-08, corrected same day to the RWKV-8-only backbone:
 ~0.98B params — 24 layers, d=1792, head_size 64, 597 one-bit Rosa streams,
 6,869 rank-1 KS3 charts, tied embeddings (Section 9).
 
-Researched 2026-11-08. No implementation has begun.
+Researched 2026-11-08. Implementation is well underway; status lives in
+Sections 13-14 (latest audit 2026-11-22: Inkling-2-Mini target, DFly2-style
+KV reuse, 4-layer untied draft).
 
 ---
 
@@ -1073,3 +1075,133 @@ Remaining boundaries: the GPU credit path is exact-but-windowed (T <= 63;
 beyond that use the CPU engine or the future suffix-automaton kernel);
 KS3 `ddown` backward cosine 0.82 vs the fp32 reference (float-exception
 candidate); int8 embedding/head (per-row-scale gather) still staged.
+
+---
+
+## 14. Target switch + DFly2 reuse architecture (2026-11-22)
+
+**Decisions (2026-11-22):** the target is **Inkling-2-Mini**
+(thinkingmachines/Inkling-2-Mini — 26.4B/5.4B-effective looped MoE, hidden
+2304, vocab 201,024, 24 layers with 6..17 looped 3x = 48 applications, 20
+SWA-1024 + 4 global layers, GQA 24Q/8KV head_dim 128 -> KV width 1024),
+served as the finalized **PTQR W4A8-G128** checkpoint at
+`~/models/Inkling-2-Mini-PTQR-W4A8-G128` (recipe:
+`../int8-vllm/scripts/serve_recipe_inkling2.sh`, TP4/fp16/
+`int8_block_g128` KV, port 8020). The draft backbone is **DFly2-style
+target-KV reuse** — Rosa is retired from the decided shape — and the model
+is **untied**: two borrowed frozen tables (input = target's BF16 embed,
+head = the deployed W4 unembed's dequantized grid), both omitted from
+share-vocab exports and lent by the serving side.
+
+### 14.1 The DFly2 reference (primary)
+
+[Tencent's DFly2](https://github.com/Tencent-Hunyuan/Hy4-flash) (Hy4-flash
+drafter, 5 layers / 0.85B; Hy4 sibling, 5 layers / 3.3B) is the
+architecture reference. Its defining properties, each checked against the
+fork's implementation (`../int8-vllm/vllm/models/hy_v4*/`):
+
+- **KV Share + Index Share**: each draft layer pairs with one target
+  sparse-attention layer and reads that layer's KV cache and indexer
+  top-k directly — no drafter-side KV cache; constant ~2K keys per draft
+  token regardless of context (`dfly_target_reuse.py`).
+- **No own vocab tables**: `has_own_embed_tokens = False`,
+  `has_own_lm_head = False` — the draft binds the target's embedding and
+  lm_head at runtime (`hy_v4/nvidia/dfly.py`). The published 0.85B is
+  essentially all trunk (~170M/layer at hidden 3072).
+- **In-process beside the target**: same checkpoint/TP; the
+  prefill->decode handoff moves one last-layer hidden state.
+
+What ksdraft adopted verbatim: the KV-reuse mechanism (per-layer taps of
+target-cached KV, causal-by-construction provider windows), the
+shared-tables doctrine (both tables borrowed; trunk-only artifacts), the
+shallow 4-layer depth, and the int8_block_g128 KV grid the draft trains
+against. Deliberate deviations (audited 2026-11-22):
+
+| Deviation | Reference | ksdraft | Why |
+| --- | --- | --- | --- |
+| attention form | target's own MLA + matched RoPE + index share | learned GQA adapters over fixed causal windows, no positional handling | Inkling is GQA+SWA with no indexer |
+| selector codebooks | free `[vocab, rank]` A/B tables | rank-256 projections of the (shared) embedding rows | params; anchors pair scores in target geometry |
+| block conv | wraps every attention+MLP sublayer | once at the block head | our parallel offsets live at the head |
+| proposal walk | temperature-sampled, returns per-step q | greedy-only | greedy verification unaffected; sampled serving needs the q path (open) |
+
+### 14.2 Decided shape (and how it got there)
+
+| step | shape | core |
+| --- | --- | --- |
+| Section 9 (Flint) | 24 x 1792 Rosa | 978M |
+| first reuse cut | 24 x 1024 | 475M |
+| width-matched | 4 x 2304, density charts | 668M |
+| +decoder interior | 4 x 2304, 13,248 charts | 750M |
+| **decided** | **4 x 2304, 24,800 charts** | **trunk 499,850,240 (~500M excl. tables)** |
+
+d = 2304 equals the target hidden (required for the verbatim table copy);
+Q rounds to 32 heads under the 8-KV-group GQA rule; KS3 expansion 10.8x
+(2.81x the reference density — an open ablation knob). Depth 4 follows the
+DFly2 precedent (5) over the old Section 9 depth doctrine (24 was an
+RWKV-World family constant carried for the Rosa backbone; it was also the
+old draft-round latency driver). Trunk is ~85% KS3, attention 15%.
+
+### 14.3 Implementation map
+
+- `ksdraft/model/reuse.py` — `TargetKVAttention` (Q from the draft stream,
+  K/V adapters from target-cached KV, per-query causal windows, zero-init
+  out projection) + `ReuseBlock` (= DraftBlock with the mixer swapped).
+  `target_kv=(k, v)` each `(B, L, T, W, kv_dim)`, one tap per layer;
+  forwards without KV raise, never silently zero.
+- Teacher seam: `TeacherSignals.kv`; `FixtureTeacher`/`KVFixture` provide
+  deterministic KV behind the same interface a real provider will use.
+  **KV grid**: `emulate_int8_kv` matches the fork's cache-write kernel
+  exactly (scale floored 1e-6, fp16-rounded, half-away-from-zero codes,
+  clamp [-128, 127]; per-(token,head) grouping == our flat-1024 groups at
+  8 heads x 128).
+- Untied tables: `KSDraftModel(..., head_init=...)` with
+  `tie_word_embeddings: false`; `scripts/init_embedding.py --copy`
+  (BF16 `model.llm.embed.weight`, verbatim) and `--unembed` (W4
+  `model.llm.unembed` dequantized per the fork's plain-layout convention:
+  low-nibble-first, `w = (code - zero) * scale`, fp16 per-row GS128).
+  Artifacts built: `runs/embedding_init.pt`, `runs/head_init.pt`
+  ([201024, 2304] fp16). Export `--share-vocab` omits both tables
+  (`shared_embedding` + `shared_head`); `load_export(embedding=, head=)`
+  binds them.
+- **KS3 fast path** (`ksdraft/kernels/ks3_wr.py`): vendored from the
+  world-record package (`~/modded-nanogpt-ks3-pr/track_1_short/ks3/`,
+  k-splanifolds CC-BY-SA-4.0 lineage — licensing is the owner's call).
+  Adds what the old fused path lacked: GS32 activation quantization
+  during training, in-kernel int8 coefficient grids (forward + VJP), the
+  NL ladder (`KSDRAFT_KS3_WR_NL`: 2 = int8 fixed-point Horner + tanh LUT,
+  1 = fp16 stages [default], 0 = fp32), fused analytic VJP with the
+  8-partial coefficient/scale/shift reductions. Dense adaptation; H100
+  paths dropped; HIP libdevice has no `sigmoid` (explicit form).
+  The float `model/ks3.py` remains the parity oracle (bit-exact vs the
+  k-splanifolds float reference — note that reference is the WRONG one
+  for training numerics; the WR package is authoritative).
+- **Optimizer** (2026-11-22): split Muon (2D maps, default on) + in-repo
+  `AdamW8bit` (`ksdraft/train/adam8bit.py`): block-wise int8 m and
+  sqrt(v), reference math aligned to modded-nanogpt's
+  `anvil.py::_adam_update_step` (eps on raw sqrt(v), corrections in the
+  step size, **cautious lr^2-scaled weight decay**, per-group betas —
+  head table (0.5, 0.95)/wd_mul 150, rest (0.9, 0.99)/no decay). eps
+  stays 1e-8 (the reference's 1e-10 is sub-grid under 8-bit storage).
+  torchao/bnb are not installed; no new dependencies.
+- Sampling contract (verified 2026-11-22): the official card states no
+  recommendation; the shipped `generation_config.json` pins **T=1.0, no
+  top-p/top-k**. The fork recipe and this repo (yaml + `HTTPTeacher`
+  defaults) are set to that.
+
+### 14.4 Memory (decided shape)
+
+Static: masters 2.4 GB + Muon fp32 momentum ~0.7 GB + 8-bit Adam states
+~0.06 GB + two frozen tables ~1.9 GB fp16. KV activations:
+`2 (K&V) x 2 B x L=4 x T x W x 1024` — ~1.1 GB at B=256/T=16/W=16.
+Everything fits one MI100 with headroom; the whole training footprint is
+~15 GB-class at B=256.
+
+### 14.5 Status and open items
+
+Implemented and CPU/GPU-unit-tested (fixtures only; no training started).
+Open: GPU regression pass + WR-vs-old-vs-reference benchmark at the real
+shape (cards were occupied 2026-11-22); sampled-proposal q path for the
+walk; the 4 KV tap *choices* among Inkling's 48 applications (provider
+decision; MTP-style spread suggested); real Inkling KV provider behind
+the teacher seam; the draft head does not replicate the target's
+`final_logit_softcapping: 30` (argmax-invariant; KL absorbs it).

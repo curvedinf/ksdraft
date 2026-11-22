@@ -37,10 +37,16 @@ def to_int8(model: KSDraftModel, group: int = 128,
     converted = copy.deepcopy(model)
     n_swapped = 0
     for block in converted.blocks:
-        rosa = block.rosa
-        for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
-            setattr(rosa, name, Int8Linear.from_float(getattr(rosa, name)))
-            n_swapped += 1
+        if hasattr(block, "rosa"):
+            rosa = block.rosa
+            for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
+                setattr(rosa, name, Int8Linear.from_float(getattr(rosa, name)))
+                n_swapped += 1
+        else:  # reuse block: DFly2-style target-KV attention
+            attn = block.attn
+            for name in ("q_proj", "k_adapter", "v_adapter", "out_proj"):
+                setattr(attn, name, Int8Linear.from_float(getattr(attn, name)))
+                n_swapped += 1
         block.ffn = KS3Int8Cell(cell=block.ffn, group=group, nonlinear=nonlinear)
         n_swapped += 1
     if converted.teacher_proj is not None:

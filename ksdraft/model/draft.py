@@ -1,9 +1,12 @@
 """KSDraftModel — the assembled draft (reference tier).
 
-Structure: tied embedding -> input norm -> DraftBlocks (Rosa + RWKV-7 delta
-rule + DSpine injection + KS3) -> output norm -> tied head. The first block's
-`first_value` seeds the first-layer value residual carried through the stack
-(k-splanifolds Model behavior).
+Structure: embedding (tied head by default; untied DFly2 pattern via
+tie_word_embeddings=False, head initialized from the dequantized W4 target
+unembed) -> input norm -> blocks -> output norm -> head. Blocks are Rosa
+mixers by default (kv_dim=0) or DFly2-style target-KV reuse attention
+(kv_dim>0, model/reuse.py); every block carries DSpine injection + KS3.
+The first block's `first_value` seeds the first-layer value residual
+carried through the stack (k-splanifolds Model behavior).
 
 Dual-source conditioning seam (DFlash/H-Spec): optional projected teacher
 states are added to the residual stream at the input. `teacher_dim` is the
@@ -22,6 +25,7 @@ from torch import nn
 from ..config import KSDraftConfig
 from .block import DraftBlock
 from .blockconv import BlockConv
+from .reuse import ReuseBlock
 from .selector import BlockSelector
 from .spine import AdjacentInjection, SpineCore
 
@@ -30,6 +34,7 @@ class KSDraftModel(nn.Module):
     def __init__(self, config: KSDraftConfig | None = None, teacher_dim: int = 0,
                  device: torch.device | str | None = None, skip_init: bool = False,
                  embedding_init: torch.Tensor | None = None,
+                 head_init: torch.Tensor | None = None,
                  transfer_space: dict | None = None):
         super().__init__()
         cfg = config or KSDraftConfig()
@@ -60,8 +65,9 @@ class KSDraftModel(nn.Module):
             rank = cfg.d_model
         self.register_buffer("transfer_C", C, persistent=True)
         self.spine_core = SpineCore(rank)
+        block_cls = ReuseBlock if cfg.kv_dim else DraftBlock
         self.blocks = nn.ModuleList(
-            [DraftBlock(cfg, layer, self.spine_core, rank, C, R_init)
+            [block_cls(cfg, layer, self.spine_core, rank, C, R_init)
              for layer in range(cfg.layers)])
         self.output_norm = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
@@ -90,8 +96,11 @@ class KSDraftModel(nn.Module):
             self.to(device)
 
         # Tie AFTER any device move: torch 2.10's .to() replaces Parameter
-        # objects on conversion, which would silently break the tie.
-        self.head.weight = self.embedding.weight
+        # objects on conversion, which would silently break the tie. An
+        # untied draft (DFly2 pattern) keeps the head as its own table —
+        # typically the dequantized W4 target unembed, frozen.
+        if cfg.tie_word_embeddings:
+            self.head.weight = self.embedding.weight
 
         if not skip_init:
             nn.init.uniform_(self.embedding.weight, -1e-4, 1e-4)
@@ -101,15 +110,26 @@ class KSDraftModel(nn.Module):
             with torch.no_grad():
                 self.embedding.weight.copy_(embedding_init.to(
                     self.embedding.weight.dtype))
+        if head_init is not None:
+            if cfg.tie_word_embeddings:
+                raise ValueError(
+                    "head_init passed but tie_word_embeddings=True — untie "
+                    "in the config to give the head its own table")
+            with torch.no_grad():
+                self.head.weight.copy_(head_init.to(self.head.weight.dtype))
 
     def trunk(self, tokens: torch.Tensor,
               teacher_states: torch.Tensor | None = None,
+              target_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
               sub_prob: float = 0.0
               ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Hidden states after the output norm, plus per-layer readouts.
 
         Teacher-forced predecessor tokens feed the optional DSpine
         substitution (paper 4.5); position 0 has no in-block predecessor.
+        ``target_kv`` is the reuse backbone's context: (k, v), each
+        (B, layers, T, W, kv_dim), one provider-aligned causal window tap
+        per draft layer.
         """
         x = self.input_norm(self.embedding(tokens))
         if teacher_states is not None:
@@ -119,11 +139,31 @@ class KSDraftModel(nn.Module):
             x = x + self.teacher_proj(
                 teacher_states.to(self.teacher_proj.weight.dtype))
 
+        k_src = v_src = None
+        if self.config.kv_dim:
+            if target_kv is None:
+                raise ValueError(
+                    "kv_dim > 0 (reuse backbone) requires target_kv=(k, v) "
+                    "at every forward — pass a KV provider through the trainer "
+                    "or the serving seam")
+            k_src, v_src = target_kv
+            if k_src.shape[1] != len(self.blocks):
+                raise ValueError(
+                    f"target_kv carries {k_src.shape[1]} layer taps but the "
+                    f"model has {len(self.blocks)} blocks")
+        elif target_kv is not None:
+            raise ValueError("target_kv passed to a Rosa-backbone model "
+                             "(kv_dim=0)")
+
         prev_tokens = torch.zeros_like(tokens)
         prev_tokens[:, 1:] = tokens[:, :-1]
         features = []
-        for block in self.blocks:
-            x, feature = block(x, prev_tokens, sub_prob)
+        for i, block in enumerate(self.blocks):
+            if k_src is not None:
+                x, feature = block(x, prev_tokens, k_src[:, i], v_src[:, i],
+                                   sub_prob)
+            else:
+                x, feature = block(x, prev_tokens, sub_prob)
             features.append(feature)
         return self.output_norm(x), features
 
@@ -131,13 +171,15 @@ class KSDraftModel(nn.Module):
         self,
         tokens: torch.Tensor,
         teacher_states: torch.Tensor | None = None,
+        target_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """tokens (B, T) -> (logits (B, T, V), per-layer transfer features)."""
-        h, features = self.trunk(tokens, teacher_states)
+        h, features = self.trunk(tokens, teacher_states, target_kv)
         return self.head(h), features
 
     def forward_block_hidden(self, tokens: torch.Tensor, n: int,
                              teacher_states: torch.Tensor | None = None,
+                             target_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
                              sub_prob: float = 0.0
                              ) -> tuple[torch.Tensor, list[torch.Tensor],
                                         torch.Tensor]:
@@ -146,21 +188,23 @@ class KSDraftModel(nn.Module):
         Training projects these through the chunked head losses so the full
         vocab logits are never materialized (see kernels/fused_train.py).
         """
-        h, features = self.trunk(tokens, teacher_states, sub_prob)
+        h, features = self.trunk(tokens, teacher_states, target_kv, sub_prob)
         anchor = h[:, -1]
         hs = self.block_conv(anchor.unsqueeze(1)
                              + self.block_delta[:n].unsqueeze(0))
         return h, features, hs
 
     def forward_block(self, tokens: torch.Tensor, n: int,
-                      teacher_states: torch.Tensor | None = None
+                      teacher_states: torch.Tensor | None = None,
+                      target_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
                       ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
         """One trunk pass returning (logits, features, block logits).
 
         Training uses this so the block loss does not pay a second trunk
         forward (memory and time); serving uses block_logits().
         """
-        h, features, hs = self.forward_block_hidden(tokens, n, teacher_states)
+        h, features, hs = self.forward_block_hidden(tokens, n, teacher_states,
+                                                    target_kv)
         return self.head(h), features, hs @ self.head.weight.t()
 
     def selector_loss(self, hs: torch.Tensor, tokens: torch.Tensor,
@@ -233,7 +277,8 @@ class KSDraftModel(nn.Module):
     @torch.no_grad()
     def propose_block_tokens(self, tokens: torch.Tensor, n: int,
                              topk: int = 16, return_conf: bool = False,
-                             refine_iters: int = 0):
+                             refine_iters: int = 0,
+                             target_kv: tuple[torch.Tensor, torch.Tensor] | None = None):
         """Greedy selector walk over the block candidates (serving path).
 
         Starts from the last verified token and conditions each position on
@@ -242,7 +287,7 @@ class KSDraftModel(nn.Module):
         from ..kernels.fused_train import linear_topk
 
         self.eval()
-        _h, _f, hs = self.forward_block_hidden(tokens, n)
+        _h, _f, hs = self.forward_block_hidden(tokens, n, target_kv=target_kv)
         b, nn_, d = hs.shape
         vals, ids = linear_topk(hs.reshape(-1, d), self.head.weight, topk)
         vals = vals.view(b, nn_, topk)
@@ -282,14 +327,15 @@ class KSDraftModel(nn.Module):
         return toks
 
     def block_logits(self, tokens: torch.Tensor, n: int,
-                     teacher_states: torch.Tensor | None = None
+                     teacher_states: torch.Tensor | None = None,
+                     target_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
                      ) -> torch.Tensor:
         """One forward -> logits for the next ``n`` tokens after the anchor.
 
         Returns (B, n, V): offset k is the distribution for token anchor+k+1.
         Uses the last input position's hidden state plus the learned offset.
         """
-        h, _ = self.trunk(tokens, teacher_states)
+        h, _ = self.trunk(tokens, teacher_states, target_kv)
         anchor = h[:, -1]
         hs = self.block_conv(anchor.unsqueeze(1)
                              + self.block_delta[:n].unsqueeze(0))

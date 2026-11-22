@@ -39,6 +39,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_size.add_argument("--rosa-bits", type=int, default=KSDraftConfig.rosa_bits)
     p_size.add_argument("--ks3-charts", type=int, default=0, help="0 = density default (3.83 per width unit)")
     p_size.add_argument("--dtype", default="int8", choices=["int8", "bf16", "fp32"])
+    p_size.add_argument("--kv-dim", type=int, default=0,
+                        help=">0: DFly2-style target-KV reuse backbone")
+    p_size.add_argument("--kv-window", type=int, default=1024)
+    p_size.add_argument("--n-kv-heads", type=int, default=8)
 
     p_mine = sub.add_parser("mine", help="build a corpus (dev docs or --live)")
     p_mine.add_argument("--live", action="store_true",
@@ -82,6 +86,13 @@ def _build_parser() -> argparse.ArgumentParser:
                          choices=["fp16", "bf16", "fp32"])
     p_train.add_argument("--grad-accum", type=int, default=None)
     p_train.add_argument("--muon", action="store_true", default=None)
+    p_train.add_argument("--no-muon", dest="muon", action="store_false",
+                         default=None,
+                         help="disable the split Muon arm (default: on)")
+    p_train.add_argument("--no-adam8bit", dest="adam8bit",
+                         action="store_false", default=None,
+                         help="fp32 Adam m/v states (default: block-wise "
+                              "int8 states with fp32 math)")
     p_train.add_argument("--muon-lr", type=float, default=None)
     p_train.add_argument("--ema-decay", type=float, default=None)
     p_train.add_argument("--lr-schedule", default=None,
@@ -105,6 +116,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--spine-sub-prob", type=float, default=None)
     p_train.add_argument("--embedding-init", default=None,
                          help=".pt tensor [vocab, d_model] (target SVD projection)")
+    p_train.add_argument("--head-init", default=None,
+                         help=".pt tensor [vocab, d_model] — the dequantized "
+                              "W4 target unembed (untied-head recipe)")
     p_train.add_argument("--freeze-embeddings", action="store_true",
                          default=None)
     p_train.add_argument("--roll-every", type=float, default=None,
@@ -120,6 +134,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--warmup-steps", type=int, default=None)
     p_train.add_argument("--save-every", type=int, default=None,
                          help="checkpoint interval in steps (default: steps/10)")
+    p_train.add_argument("--kv-dim", type=int, default=None,
+                         help=">0: DFly2-style target-KV reuse backbone "
+                              "(overrides the config file)")
+    p_train.add_argument("--kv-window", type=int, default=None)
+    p_train.add_argument("--n-kv-heads", type=int, default=None)
+    p_train.add_argument("--kv-fixture", action="store_true", default=False,
+                         help="teacherless stages: deterministic synthetic KV "
+                              "provider (smoke/dev only, not a real teacher)")
 
     p_gate = sub.add_parser("gate", help="run the dtype-tier parity battery")
     p_gate.add_argument("--config", default="configs/flint.yaml")
@@ -135,6 +157,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--dtype", default="fp16",
                           choices=["fp16", "bf16", "fp32", "int8"],
                           help="artifact dtype (int8 stores codes+scales)")
+    p_export.add_argument("--share-vocab", action="store_true", default=False,
+                          help="omit the tied embedding table (DFly2 pattern: "
+                               "the serving side binds the target's own)")
 
     return parser
 
@@ -153,11 +178,13 @@ def _load_target_config(path: str) -> tuple[KSDraftConfig, dict, dict]:
 
 
 def _propose_shape(vocab: int, budget: float, layers: int = 24,
-                   head: int = 64) -> KSDraftConfig:
+                   head: int = 64, kv_dim: int = 0,
+                   n_kv_heads: int = 8) -> KSDraftConfig:
     """RESEARCH Section 9 proposal: widest head-aligned d under the budget.
 
     Depth stays at the family constant (24), streams track d/3, charts track
     d*368/96, and the tied embedding (vocab x d) is part of the budget.
+    kv_dim > 0 sizes the DFly2-style reuse attention instead of Rosa.
     """
     best = None
     for d in range(head, 4097, head):
@@ -165,7 +192,8 @@ def _propose_shape(vocab: int, budget: float, layers: int = 24,
         charts = max(1, round(d * 368 / 96))
         c = KSDraftConfig(vocab_size=vocab, layers=layers, d_model=d,
                           head_size=head, rosa_streams=s,
-                          ks3_charts=charts)
+                          ks3_charts=charts, kv_dim=kv_dim,
+                          n_kv_heads=n_kv_heads)
         if c.total_params() <= budget:
             best = c
         else:
@@ -178,12 +206,18 @@ def _propose_shape(vocab: int, budget: float, layers: int = 24,
 def _cmd_size(args: argparse.Namespace) -> int:
     if getattr(args, "propose", False):
         cfg = _propose_shape(args.vocab, args.budget, layers=args.layers,
-                             head=args.head_size)
+                             head=args.head_size,
+                             kv_dim=getattr(args, "kv_dim", 0) or 0,
+                             n_kv_heads=getattr(args, "n_kv_heads", 8) or 8)
         ratio = cfg.total_params() / max(1.0, args.target_active)
+        mixer = "kv-reuse" if cfg.kv_dim else "rosa"
         print(f"proposed shape for vocab={args.vocab:,}, "
-              f"budget={args.budget/1e9:.2f}B core")
+              f"budget={args.budget/1e9:.2f}B core ({mixer} mixer)")
         print(f"  d_model {cfg.d_model}, layers {cfg.layers}, "
               f"streams {cfg.rosa_streams}, charts {cfg.charts}")
+        if cfg.kv_dim:
+            print(f"  attention {cfg.q_heads} q-heads <- {cfg.n_kv_eff} "
+                  f"kv-heads (kv_dim {cfg.kv_dim}, W {cfg.kv_window})")
         print(f"  core {cfg.total_params():,} "
               f"({cfg.total_params()/1e9:.3f}B)")
         if args.target_active:
@@ -201,14 +235,22 @@ def _cmd_size(args: argparse.Namespace) -> int:
         rosa_bits=args.rosa_bits,
         ks3_charts=args.ks3_charts,
         dtype=args.dtype,
+        kv_dim=getattr(args, "kv_dim", 0) or 0,
+        n_kv_heads=getattr(args, "n_kv_heads", 8) or 8,
+        kv_window=getattr(args, "kv_window", 1024) or 1024,
     )
     s = cfg.summary()
     print(f"ksdraft shape budget (dtype={s['dtype']})")
     print(f"  layers            {s['layers']}")
     print(f"  d_model           {s['d_model']}  (head granularity: {s['n_heads']} x {s['head_size']})")
-    print(f"  rosa              {s['rosa_streams']} streams x {s['rosa_bits']} bit(s)")
+    if s["kv_dim"]:
+        print(f"  attn(kv-reuse)    {s['attn_params_per_layer']:>15,}  "
+              f"({s['q_heads']} q-heads <- {s['n_kv_heads']} kv-heads, "
+              f"kv_dim {s['kv_dim']}, W {s['kv_window']})")
+    else:
+        print(f"  rosa              {s['rosa_streams']} streams x {s['rosa_bits']} bit(s)")
+        print(f"  rosa/layer        {s['rosa_params_per_layer']:>15,}")
     print(f"  ks3 charts        {s['ks3_charts']}")
-    print(f"  rosa/layer        {s['rosa_params_per_layer']:>15,}")
     print(f"  ks3/layer         {s['ks3_params_per_layer']:>15,}")
     print(f"  total/layer       {s['layer_params']:>15,}")
     print(f"  embedding (tied)  {s['embedding_params']:>15,}")
@@ -287,6 +329,12 @@ def _cmd_train(args: argparse.Namespace) -> int:
     from .train import Trainer, TrainConfig, WindowSampler
 
     cfg, tspec, trspec = _load_target_config(args.config)
+    if getattr(args, "kv_dim", None) is not None:
+        cfg.kv_dim = args.kv_dim
+    if getattr(args, "kv_window", None) is not None:
+        cfg.kv_window = args.kv_window
+    if getattr(args, "n_kv_heads", None) is not None:
+        cfg.n_kv_heads = args.n_kv_heads
     bounds = None
     if args.corpus == "synthetic":
         ids = synthetic_ids(args.corpus_size, cfg.vocab_size)
@@ -324,20 +372,50 @@ def _cmd_train(args: argparse.Namespace) -> int:
     elif args.stage == "distill":
         d_tap = int(tspec.get("fixture_d_tap", 64))
         teacher = FixtureTeacher(cfg.vocab_size, d_tap=d_tap, n_taps=n_taps,
-                                 topk=int(tspec.get("topk_logits", 32)))
+                                 topk=int(tspec.get("topk_logits", 32)),
+                                 kv_dim=cfg.kv_dim,
+                                 kv_window=min(cfg.kv_window,
+                                               args.seq_len or 64),
+                                 kv_taps=cfg.layers if cfg.kv_dim else None)
         teacher_dim = n_taps * d_tap
 
     torch.manual_seed(0)
     emb_init = None
-    if args.embedding_init:
-        emb_init = torch.load(args.embedding_init, map_location="cpu",
+    emb_path = (getattr(args, "embedding_init", None)
+                or trspec.get("embedding_init"))
+    if emb_path:
+        emb_init = torch.load(emb_path, map_location="cpu",
                               weights_only=True)
+    head_init = None
+    head_path = (getattr(args, "head_init", None)
+                 or trspec.get("head_init"))
+    if head_path:
+        head_init = torch.load(head_path, map_location="cpu",
+                               weights_only=True)
     ts_space = None
     if getattr(args, "transfer_space", None):
         ts_space = torch.load(args.transfer_space, map_location="cpu",
                               weights_only=True)
     model = KSDraftModel(cfg, teacher_dim=teacher_dim, embedding_init=emb_init,
-                         transfer_space=ts_space)
+                         head_init=head_init, transfer_space=ts_space)
+    kv_provider = None
+    if cfg.kv_dim:
+        print(f"reuse backbone: kv_dim={cfg.kv_dim} "
+              f"({cfg.q_heads} q-heads <- {cfg.n_kv_eff} kv-heads, "
+              f"W={cfg.kv_window})", flush=True)
+        if teacher is None:
+            if getattr(args, "kv_fixture", False):
+                from .teacher import KVFixture
+                kv_provider = KVFixture(
+                    cfg.layers, cfg.kv_dim,
+                    kv_window=min(cfg.kv_window, args.seq_len or 64), seed=11)
+                print("kv: fixture provider (synthetic — smoke/dev only)",
+                      flush=True)
+            else:
+                raise SystemExit(
+                    "kv_dim>0 (reuse backbone) needs a KV source for "
+                    "teacherless stages: --kv-fixture (synthetic smoke/dev) "
+                    "or a teacher client whose signals() returns kv")
     tcfg = TrainConfig(
         steps=args.steps or int(trspec.get("steps", 50)),
         seq_len=args.seq_len or 64,
@@ -357,6 +435,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
                     else TrainConfig.grad_accum),
         muon=(bool(args.muon) if args.muon is not None
               else TrainConfig.muon),
+        adam8bit=(bool(args.adam8bit) if args.adam8bit is not None
+                  else TrainConfig.adam8bit),
         muon_lr=(args.muon_lr if args.muon_lr is not None
                  else TrainConfig.muon_lr),
         ema_decay=(args.ema_decay if args.ema_decay is not None
@@ -368,7 +448,9 @@ def _cmd_train(args: argparse.Namespace) -> int:
                               else TrainConfig.block_position_decay),
         freeze_embeddings=(bool(args.freeze_embeddings)
                            if args.freeze_embeddings is not None
-                           else TrainConfig.freeze_embeddings),
+                           else bool(trspec.get(
+                               "freeze_embeddings",
+                               TrainConfig.freeze_embeddings))),
         block_ce_weight=(args.block_ce_weight
                          if args.block_ce_weight is not None
                          else TrainConfig.block_ce_weight),
@@ -394,7 +476,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
                         else TrainConfig.spine_sub_prob),
     )
     trainer = Trainer(model, teacher, sampler, tcfg, device=args.device,
-                      out_dir=args.out)
+                      out_dir=args.out, kv_provider=kv_provider)
     if args.resume:
         ck = trainer.load(args.resume)
         print(f"resumed from {args.resume} (step {ck['step']})")
@@ -456,7 +538,8 @@ def _cmd_export(args: argparse.Namespace) -> int:
     from .export import export_model
 
     model = _load_model(args).to(args.device)
-    path = export_model(model, args.out, dtype=args.dtype)
+    path = export_model(model, args.out, dtype=args.dtype,
+                        share_vocab=bool(getattr(args, "share_vocab", False)))
     print(f"exported -> {path}")
     return 0
 

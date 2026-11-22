@@ -7,6 +7,7 @@ time-mixing layer, with KS3 spine decoders. The optimized INT8 tier
 
 from .ks3 import KS3, spine_horner, spine_basis
 from .rosa import RosaMixer
+from .reuse import ReuseBlock, TargetKVAttention
 from .spine import AdjacentInjection
 from .block import DraftBlock
 from .draft import KSDraftModel
@@ -14,6 +15,7 @@ from .int8_convert import to_int8, int8_surfaces
 
 __all__ = [
     "KS3", "spine_horner", "spine_basis", "RosaMixer",
+    "ReuseBlock", "TargetKVAttention",
     "AdjacentInjection", "DraftBlock", "KSDraftModel",
     "to_int8", "int8_surfaces",
 ]

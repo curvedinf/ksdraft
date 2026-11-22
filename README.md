@@ -4,17 +4,42 @@ Parallel block-drafting draft models for speculative decoding.
 
 Architecture:
 
+- **DFly2-style target-KV reuse** (primary reference:
+  [Tencent Hy4-flash DFly2](https://github.com/Tencent-Hunyuan/Hy4-flash)) —
+  the draft's time-mixing layer is cross-attention into target-cached KV;
+  no drafter-side KV cache
+- **Untied borrowed tables** (DFly2 pattern): input = the target's BF16
+  embedding, head = the deployed W4 unembed's dequantized grid; both
+  frozen, both omitted from `--share-vocab` exports
+- **KS3 decoders** with the world-record fast path (GS32 activation
+  grids, in-kernel int8 coefficient grids, NL Horner ladder, fused VJP)
 - **DSpine depth-carried causal injection**
-- **JetSpec++ foresight pipelining**
-- **EAGLE-Harness-style cost scheduler**
-- **RWKV-8 Rosa attention**
-- **KS3 decoders**
-- **Fully native INT8 forward and backward**
-- **PTQR rounding-dither annealing**
+- **DFlash2-style block head** (offsets + dynamic conv + pairwise
+  selector + last-write refinement)
+- **Split Muon + 8-bit AdamW** (block-wise int8 m/√v, modded-nanogpt
+  reference math)
+- **PTQR rounding-dither annealing** to the INT8 serving tier
 
-Status: implementation in progress. The full architecture research, decisions, and
-training-regime design live in [RESEARCH.md](RESEARCH.md) — it is the source of
-truth for every design choice in this repo.
+Status: implementation in progress; no training runs yet. The full
+architecture research, decisions, and audits live in
+[RESEARCH.md](RESEARCH.md) — it is the source of truth for every design
+choice in this repo (see Section 14 for the current target and shape).
+
+## Target
+
+**Inkling-2-Mini** (26.4B/5.4B-effective looped MoE), served as the
+finalized PTQR **W4A8-G128** checkpoint
+(`~/models/Inkling-2-Mini-PTQR-W4A8-G128`, recipe in the
+`../int8-vllm` fork: TP4 / fp16 / `int8_block_g128` KV / T=1.0). The
+draft trains against the deployed KV grid and head grid — the
+exact-tier-student doctrine applied to the reuse seam.
+
+## Decided draft shape (`configs/inkling.yaml`)
+
+4 layers x d=2304 (= target hidden), 32Q/8KV GQA adapters (kv_dim 1024),
+KS3 24,800 charts: **trunk 499,850,240 (~500M excluding the borrowed
+tables)**. d_model matching the target hidden is what makes the verbatim
+embedding copy and the W4 head dequant exact.
 
 ## Install
 
@@ -33,23 +58,36 @@ ladder, stage commands, and known boundaries.
 ## Quick start
 
 ```bash
-# Draft-shape budget for the decided configuration (RESEARCH.md Section 9)
-ksdraft size
-ksdraft size --layers 24 --d-model 1536 --vocab 150144 --rosa-streams 512
+# decided shape budget (trunk-only; tables are borrowed at serve)
+ksdraft size --layers 4 --d-model 2304 --kv-dim 1024 --ks3-charts 24800 --vocab 201024
+
+# init the two borrowed tables from the finalized target
+python scripts/init_embedding.py --copy --device cpu \
+    --target ~/models/Inkling-2-Mini-PTQR-W4A8-G128 \
+    --tensor model.llm.embed.weight --d-model 2304 --out runs/embedding_init.pt
+python scripts/init_embedding.py --unembed \
+    --target ~/models/Inkling-2-Mini-PTQR-W4A8-G128 --out runs/head_init.pt
+
+# smoke train (fixture KV — synthetic, dev only)
+ksdraft train --config configs/inkling.yaml --stage warmup --device cuda \
+    --steps 8 --kv-fixture
+
+# trunk-only serving artifact (the engine lends both tables)
+ksdraft export --share-vocab ...
 ```
 
 ## Layout
 
 ```
 ksdraft/
-  config.py     # KSDraftConfig — the decided draft shape and dtype tiers
+  config.py     # KSDraftConfig — shape + dtype tiers + exact budgets
   cli.py        # ksdraft size | mine | train | gate | export
-  model/        # Rosa mixer, KS3 decoder, DSpine injection, KSDraftModel
-  kernels/      # INT8 tier: W8A8 GS128 fused kernels (int8 forward + backward)
-  teacher/      # teacher clients: fixture | HF bf16 | in-process INT8 (int8-vllm)
-  train/        # staged training regime (RESEARCH.md Section 11)
-  data/         # corpus builders incl. tier-5 512k needle-in-a-haystack
-configs/        # target adapters (flint.yaml first)
+  model/        # ReuseBlock + TargetKVAttention, KS3, DSpine, KSDraftModel
+  kernels/      # ks3_wr.py (WR fast path), int8 tier, fused train losses
+  teacher/      # teacher clients: fixture (KV!) | HF bf16 | HTTP logprobs
+  train/        # staged trainer + AdamW8bit (split Muon default)
+  data/         # corpus builders
+configs/        # target adapters (flint.yaml historical; inkling.yaml current)
 tests/
 ```
 
@@ -63,4 +101,6 @@ Training is INT8-native regardless of the serving tier.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The vendored KS3 fast path
+(`ksdraft/kernels/ks3_wr.py`) derives from k-splanifolds-lineage code
+marked CC-BY-SA-4.0; provenance is recorded in the file.

@@ -21,17 +21,89 @@ from typing import Iterable, Sequence
 import torch
 
 
+def fixture_kv_stream(tokens: torch.Tensor, layers: int, kv_dim: int,
+                      base_salt: int, seed: int = 0) -> torch.Tensor:
+    """Deterministic synthetic per-layer KV stream, (B, layers, T, kv_dim).
+
+    Same hash recipe as ``FixtureTeacher._hash`` (seeded per position), so
+    fixture KV is reproducible across processes and runs.
+    """
+    B, T = tokens.shape
+    out = torch.empty(B, layers, T, kv_dim, device=tokens.device)
+    g = torch.Generator(device=tokens.device)
+    for b in range(B):
+        for t in range(T):
+            for l in range(layers):
+                g.manual_seed(int((int(tokens[b, t]) * 1000003 + t * 31 + b * 7919
+                                   + (base_salt + l) * 104729 + seed) % (2**31)))
+                out[b, l, t] = torch.randn(kv_dim, generator=g,
+                                           device=tokens.device)
+    return out
+
+
+def emulate_int8_kv(stream: torch.Tensor, group: int = 128) -> torch.Tensor:
+    """Round a KV stream onto the deployed int8_block_g128 grid.
+
+    The serving stack caches target KV as int8_block_g128, so the draft's
+    conditioning signal at serving is the dequantized grid, not clean fp16.
+    Training through this pass keeps the train/serve KV distributions
+    identical (the PTQR exact-tier-student doctrine applied to the reuse
+    seam).
+
+    Matches the fork's cache-write kernel exactly
+    (vllm/v1/attention/ops/triton_reshape_and_cache_flash.py):
+    - per-group scale = amax/127 floored at 1e-6, rounded via fp16 and used
+      in that rounded form for encoding;
+    - codes round HALF-AWAY-FROM-ZERO (not banker's rounding);
+    - codes clamp to [-128, 127] (the asymmetric int8 range).
+    Grouping runs along the flat channel dim: for Inkling's 8 KV heads of
+    128 the group boundaries coincide with the kernel's per-head vectors.
+    """
+    flat = stream.detach().float().reshape(-1)
+    n = flat.numel()
+    pad = (-n) % group
+    if pad:
+        flat = torch.cat([flat, flat.new_zeros(pad)])
+    blocks = flat.view(-1, group)
+    amax = blocks.abs().amax(dim=1)
+    scale = (amax / 127.0).clamp_min(1e-6)
+    scale = scale.to(torch.float16).to(torch.float32)
+    q = blocks / scale.unsqueeze(1)
+    q = torch.where(q >= 0, q + 0.5, q - 0.5).trunc()   # half away from zero
+    q = q.clamp_(-128.0, 127.0)
+    return (q * scale.unsqueeze(1)).reshape(-1)[:n].view_as(stream)
+
+
+def causal_kv_windows(stream: torch.Tensor, window: int) -> torch.Tensor:
+    """(B, L, T, D) stream -> (B, L, T, W, D) provider-aligned causal windows.
+
+    Query t's window covers stream positions [t - W + 1, t] clamped at 0:
+    causal by construction, the contract TargetKVAttention consumes.
+    """
+    B, L, T, D = stream.shape
+    W = min(window, T)
+    pos = (torch.arange(T, device=stream.device)[:, None]
+           + torch.arange(W, device=stream.device)[None, :] - (W - 1)
+           ).clamp_min(0)
+    return stream[:, :, pos]
+
+
 @dataclass
 class TeacherSignals:
     states: torch.Tensor | None     # (B, T, n_taps, d_tap) fp16
     topk_ids: torch.Tensor          # (B, T, k) int64
     topk_probs: torch.Tensor        # (B, T, k) fp16
+    # DFly2-style target-KV reuse: (k, v), each (B, layers, T, W, kv_dim)
+    # fp16 — one provider-aligned causal window tap per draft layer.
+    kv: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def to(self, device, dtype=torch.float16):
         return TeacherSignals(
             self.states.to(device=device, dtype=dtype) if self.states is not None else None,
             self.topk_ids.to(device),
             self.topk_probs.to(device=device, dtype=dtype),
+            kv=(tuple(t.to(device=device, dtype=dtype) for t in self.kv)
+                if self.kv is not None else None),
         )
 
 
@@ -57,12 +129,18 @@ class FixtureTeacher(TeacherClient):
     not by the fixture being a real teacher)."""
 
     def __init__(self, vocab_size: int, d_tap: int = 64, n_taps: int = 6,
-                 topk: int = 8, seed: int = 0):
+                 topk: int = 8, seed: int = 0, kv_dim: int = 0,
+                 kv_window: int = 16, kv_taps: int | None = None,
+                 kv_quant_group: int = 128):
         self.vocab_size = vocab_size
         self.d_tap = d_tap
         self.n_taps = n_taps
         self.topk = topk
         self.seed = seed
+        self.kv_dim = kv_dim
+        self.kv_window = kv_window
+        self.kv_taps = kv_taps if kv_taps is not None else n_taps
+        self.kv_quant_group = kv_quant_group
 
     def _hash(self, tokens: torch.Tensor, salt: int) -> torch.Tensor:
         g = torch.Generator(device=tokens.device)
@@ -87,7 +165,18 @@ class FixtureTeacher(TeacherClient):
             + 0.01 * tokens.to(torch.float32).unsqueeze(-1)
         probs = torch.softmax(logits, dim=-1)
         topk_p, topk_i = probs.topk(self.topk, dim=-1)
-        return TeacherSignals(states, topk_i, topk_p.to(torch.float16))
+        kv = None
+        if self.kv_dim:
+            k_stream = fixture_kv_stream(tokens, self.kv_taps, self.kv_dim,
+                                         9_000, self.seed)
+            v_stream = fixture_kv_stream(tokens, self.kv_taps, self.kv_dim,
+                                         9_100, self.seed)
+            if self.kv_quant_group:
+                k_stream = emulate_int8_kv(k_stream, self.kv_quant_group)
+                v_stream = emulate_int8_kv(v_stream, self.kv_quant_group)
+            kv = (causal_kv_windows(k_stream, self.kv_window).to(torch.float16),
+                  causal_kv_windows(v_stream, self.kv_window).to(torch.float16))
+        return TeacherSignals(states, topk_i, topk_p.to(torch.float16), kv)
 
     def _hash8(self, tokens: torch.Tensor, salt: int) -> torch.Tensor:
         """(B, T, 8) hash used to synthesize per-position vocab logits."""
@@ -100,6 +189,44 @@ class FixtureTeacher(TeacherClient):
                                    + salt * 104729 + self.seed) % (2**31)))
                 out[b, t] = torch.randn(8, generator=g, device=tokens.device)
         return out
+
+
+class KVFixture(TeacherClient):
+    """Deterministic synthetic target KV only, behind the teacher seam.
+
+    The teacherless reuse stages (warm-up, smoke tests) need a KV source
+    even with no target model; this provider supplies the same hash recipe
+    as ``FixtureTeacher``'s kv, without any logprob/states work. The topk
+    fields are placeholders (never consumed on this path).
+    """
+
+    def __init__(self, layers: int, kv_dim: int, kv_window: int = 16,
+                 seed: int = 0, kv_quant_group: int = 128):
+        self.layers = int(layers)
+        self.kv_dim = int(kv_dim)
+        self.kv_window = int(kv_window)
+        self.seed = seed
+        self.kv_quant_group = kv_quant_group
+        self.vocab_size = 0
+        self.n_taps = self.layers
+        self.topk = 1
+
+    def signals(self, tokens: torch.Tensor) -> TeacherSignals:
+        B, T = tokens.shape
+        k_stream = fixture_kv_stream(tokens, self.layers, self.kv_dim,
+                                     9_000, self.seed)
+        v_stream = fixture_kv_stream(tokens, self.layers, self.kv_dim,
+                                     9_100, self.seed)
+        if self.kv_quant_group:
+            k_stream = emulate_int8_kv(k_stream, self.kv_quant_group)
+            v_stream = emulate_int8_kv(v_stream, self.kv_quant_group)
+        kv = (causal_kv_windows(k_stream, self.kv_window).to(torch.float16),
+              causal_kv_windows(v_stream, self.kv_window).to(torch.float16))
+        return TeacherSignals(
+            states=None,
+            topk_ids=torch.zeros(B, T, 1, dtype=torch.int64),
+            topk_probs=torch.ones(B, T, 1, dtype=torch.float16),
+            kv=kv)
 
 
 class HFTeacher(TeacherClient):

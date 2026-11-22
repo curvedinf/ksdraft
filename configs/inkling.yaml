@@ -1,0 +1,89 @@
+# ksdraft target adapter: Thinking Machines Inkling-2-Mini
+# (https://huggingface.co/thinkingmachines/Inkling-2-Mini).
+# The second target adapter; core code never branches on target identity.
+#
+# DFly2-style reuse draft (RESEARCH discussion 2026-11): the Rosa mixer is
+# replaced by cross-attention over target-cached KV; the drafter keeps no
+# KV of its own. Training/experimentation only — the KV provider is the
+# teacher seam (fixture today; a real Inkling KV provider is a later,
+# separate step). No serving-engine integration.
+
+target:
+  name: inkling-2-mini
+  hf_id: thinkingmachines/Inkling-2-Mini
+  kind: looped_moe
+  total_params: 26.4e9
+  active_params: 5.4e9        # 3.4B + 2 extra loop passes (~1B each)
+  layers: 24                  # layers 6..17 loop 3x -> 48 applications/token
+  vocab_size: 201024
+  context: 1048576
+  # Official sampling contract (verified 2026-11-22): the model card carries
+  # no recommendation; the shipped generation_config.json pins temperature
+  # 1.0 with do_sample and NO top-p/top-k truncation.
+  sampling: {temperature: 1.0}
+  attention:
+    heads_q: 24
+    heads_kv: 8               # GQA; KV width = 8 x 128 = 1024 per layer
+    head_dim: 128
+    sliding_window: 1024
+    local_layers: 20
+    global_layers: [5, 11, 17, 23]
+  loop: {core_start: 6, core_end: 18, passes: 3}
+  mtp: {layers: 3, block_size: 8, target_layer_ids: [5, 23, 41, 48]}
+  logit_softcapping: 30.0
+
+teacher:
+  # No KV-returning client exists yet (the HTTP teacher is logprobs-only);
+  # dev/test runs use the fixture KV behind the same seam. The deployed KV
+  # is int8_block_g128 (fork doctrine) — providers emulate that grid on the
+  # stream (kv_quant_group=128) so training matches serving exactly.
+  client: fixture
+  state_taps: [5, 23, 41, 47]   # final-pass applications (informational)
+  topk_logits: 32
+  kv_cache_dtype: int8_block_g128
+
+draft:                        # 4-layer reuse shape (decided 2026-11-22):
+                               # d=2304 (matches target hidden), charts 24800
+                               # -> trunk 499,850,240 (~500M excl. embedding);
+                               # 963,009,536 with the tied table
+  layers: 4                   # DFly2 precedent (Hy4/Hy4-flash: 5); 4 KV taps
+  d_model: 2304               # == Inkling-2-Mini hidden_size; Q rounds to
+                               # 32 heads (2048) under the 8-KV-group GQA rule
+  head_size: 64
+  kv_dim: 1024                # DFly2-style target-KV reuse (Rosa off)
+  n_kv_heads: 8
+  kv_window: 1024
+  ks3_charts: 24800           # 2.81x the d*368/96 density (8832)
+  block_len: 16
+  anchor_stride: 64
+  dtype: int8                 # int8 | bf16 | fp32
+  tie_word_embeddings: false  # untied (DFly2 pattern, decided 2026-11-22):
+                               # input = BF16 target embed copy, head =
+                               # dequantized W4 unembed grid; both frozen
+                               # and both borrowed at serve (--share-vocab)
+
+training:                     # RESEARCH.md Section 11 pattern
+  corpus:
+    n_c4: 3500
+    n_agent: 800
+    n_long: 48
+    n_xlong: 128
+  stages: [warmup, distill, refine, acceptance, ptqr]
+  # Decided 2026-11-22: split Muon (2D maps) + AdamW with block-wise int8
+  # m/sqrt(v) states. Update math aligned to the modded-nanogpt reference
+  # (cautious lr^2-scaled weight decay, eps on raw sqrt(v), per-group betas:
+  # head table (0.5, 0.95)/wd_mul 150, rest (0.9, 0.99)/no decay; eps stays
+  # 1e-8 — the reference's 1e-10 is sub-grid under 8-bit storage).
+  # CLI opt-outs: --no-muon, --no-adam8bit.
+  optimizer: {kind: split_muon_adamw8bit, peak_lr: 3.0e-4,
+              muon_lr: 2.0e-3, schedule: cosine, grad_clip: 1.0}
+  # Shared-embedding recipe (decided 2026-11-22, DFly2 pattern, untied):
+  # input = verbatim frozen copy of the target's BF16 table, head = frozen
+  # copy of the deployed W4 unembed's dequantized grid; export trunk-only
+  # with `ksdraft export --share-vocab` (the serving side lends both).
+  embedding_init: runs/embedding_init.pt   # scripts/init_embedding.py --copy \
+      # --target ~/models/Inkling-2-Mini-PTQR-W4A8-G128 \
+      # --tensor model.llm.embed.weight (BF16 [201024, 2304], unquantized)
+  head_init: runs/head_init.pt             # scripts/init_embedding.py \
+      # --unembed --target ~/models/Inkling-2-Mini-PTQR-W4A8-G128
+  freeze_embeddings: true

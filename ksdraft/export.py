@@ -19,7 +19,13 @@ from .model import KSDraftModel
 
 
 def export_model(model: KSDraftModel, out_dir: str,
-                 dtype: str = "fp16") -> Path:
+                 dtype: str = "fp16", share_vocab: bool = False) -> Path:
+    """Write a portable draft checkpoint.
+
+    ``share_vocab=True`` (the DFly2 pattern): the artifact omits the tied
+    vocab table and records ``shared_embedding`` — the serving side binds
+    the target's own embedding/lm_head, so the draft ships only its trunk.
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     c = model.config
@@ -39,6 +45,11 @@ def export_model(model: KSDraftModel, out_dir: str,
         "dtype": dtype,
         "config": c.summary(),
     }
+    if share_vocab:
+        meta["shared_embedding"] = True
+        if not c.tie_word_embeddings:
+            # the target holds both tables; the draft artifact is trunk-only
+            meta["shared_head"] = True
     if getattr(model, "spine_core", None) is not None:
         meta["transfer_rank"] = int(model.spine_core.rank)
     if getattr(model, "teacher_dim", 0):
@@ -71,6 +82,11 @@ def export_model(model: KSDraftModel, out_dir: str,
                   for k, v in sd.items()}
     if model.head.weight is model.embedding.weight:
         sd.pop("head.weight", None)  # safetensors forbids shared storage; retied on load
+    if share_vocab:
+        # the target already holds the table(s); the draft artifact is trunk-only
+        sd.pop("embedding.weight", None)
+        if not c.tie_word_embeddings:
+            sd.pop("head.weight", None)
     try:
         from safetensors.torch import save_file
         save_file(sd, str(out / "ksdraft.safetensors"),
@@ -85,10 +101,19 @@ def export_model(model: KSDraftModel, out_dir: str,
     return weights
 
 
-LOADER_SHIM = '# SPDX-License-Identifier: Apache-2.0\n"""Loader for a ksdraft draft repo (checkpoint + config + this shim).\n\n    from modeling_ksdraft import from_pretrained\n    draft = from_pretrained("path/to/repo", device="cuda")\n\nThe model class is the package\'s ksdraft.model.KSDraftModel; proposals\ngo through propose_block_tokens / block_logits (see ksdraft.export).\n"""\nfrom ksdraft.export import load_export\n\n\ndef from_pretrained(path, device="cpu"):\n    return load_export(str(path), device=device)\n\n\ndef load_draft(path, device="cpu"):\n    return load_export(str(path), device=device)\n'
+LOADER_SHIM = '# SPDX-License-Identifier: Apache-2.0\n"""Loader for a ksdraft draft repo (checkpoint + config + this shim).\n\n    from modeling_ksdraft import from_pretrained\n    draft = from_pretrained("path/to/repo", device="cuda")\n\nThe model class is the package\'s ksdraft.model.KSDraftModel; proposals\ngo through propose_block_tokens / block_logits (see ksdraft.export).\nShared-embedding artifacts require the target\'s [vocab, d] tables —\nboth, when the draft is untied:\n\n    draft = from_pretrained("path/to/repo", embedding=target_embed,\n                             head=target_lm_head)\n"""\nfrom ksdraft.export import load_export\n\n\ndef from_pretrained(path, device="cpu", embedding=None, head=None):\n    return load_export(str(path), device=device, embedding=embedding,\n                       head=head)\n\n\ndef load_draft(path, device="cpu", embedding=None, head=None):\n    return load_export(str(path), device=device, embedding=embedding,\n                       head=head)\n'
 
 
-def load_export(out_dir: str, device: str = "cpu") -> KSDraftModel:
+def load_export(out_dir: str, device: str = "cpu",
+                embedding: torch.Tensor | None = None,
+                head: torch.Tensor | None = None) -> KSDraftModel:
+    """Rebuild an exported draft.
+
+    ``embedding`` / ``head``: the external [vocab, d_model] tables a
+    shared-embedding artifact expects (the target's own tables — dims must
+    match exactly). A tied artifact takes one; an untied (DFly2-pattern)
+    artifact takes both.
+    """
     out = Path(out_dir)
     meta = json.loads((out / "config.json").read_text())
     s = meta["config"]
@@ -97,13 +122,40 @@ def load_export(out_dir: str, device: str = "cpu") -> KSDraftModel:
         head_size=s["head_size"], rosa_streams=s["rosa_streams"],
         rosa_bits=s["rosa_bits"], ks3_charts=s["ks3_charts"],
         block_len=s.get("block_len", 16),
-        dtype=s["dtype"], tie_word_embeddings=True,
+        dtype=s["dtype"],
+        tie_word_embeddings=s.get("tie_word_embeddings", True),
+        kv_dim=s.get("kv_dim", 0), n_kv_heads=s.get("n_kv_heads", 8),
+        kv_window=s.get("kv_window", 1024),
     )
+    shared = bool(meta.get("shared_embedding"))
+    if shared:
+        if embedding is None:
+            raise ValueError(
+                "this artifact shares the target's embedding (shared_embedding): "
+                "pass the target's [vocab, d_model] table via embedding=")
+        if not cfg.tie_word_embeddings and head is None:
+            raise ValueError(
+                "this artifact is untied and shares both tables "
+                "(shared_head): pass the target's lm_head via head=")
+    for name, tensor in (("embedding", embedding), ("head", head)):
+        if tensor is not None and tuple(tensor.shape) != (
+                cfg.vocab_size, cfg.d_model):
+            raise ValueError(
+                f"external {name} {tuple(tensor.shape)} does not match "
+                f"the draft's [{cfg.vocab_size}, {cfg.d_model}]")
     ts_space = None
     if meta.get("transfer_rank"):
         ts_space = {"rank": int(meta["transfer_rank"])}
     model = KSDraftModel(cfg, teacher_dim=meta.get("teacher_dim", 0),
                          transfer_space=ts_space)
+    if shared:
+        with torch.no_grad():
+            # in-place copy keeps the tie when tied: head.weight is embedding.weight
+            model.embedding.weight.copy_(
+                embedding.to(model.embedding.weight.dtype))
+            if not cfg.tie_word_embeddings:
+                model.head.weight.copy_(
+                    head.to(model.head.weight.dtype))
     st_path = out / "ksdraft.safetensors"
     if st_path.exists():
         from safetensors.torch import load_file
@@ -130,6 +182,10 @@ def load_export(out_dir: str, device: str = "cpu") -> KSDraftModel:
     # Exports made before the parallel block head (or other new surfaces)
     # load with those parameters freshly initialized.
     missing, _ = model.load_state_dict(sd, strict=False)
+    if shared:
+        # the external table(s) were copied in above, not loaded from state
+        missing = [k for k in missing
+                   if k not in ("embedding.weight", "head.weight")]
     if missing:
         print(f"[load_export] {len(missing)} new parameter(s) fresh: "
               f"{missing[:3]}")
