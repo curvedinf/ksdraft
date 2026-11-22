@@ -1205,3 +1205,36 @@ walk; the 4 KV tap *choices* among Inkling's 48 applications (provider
 decision; MTP-style spread suggested); real Inkling KV provider behind
 the teacher seam; the draft head does not replicate the target's
 `final_logit_softcapping: 30` (argmax-invariant; KL absorbs it).
+
+### 14.6 INT8-everything training + full-depth mining (2026-11-22)
+
+User directive: the model, all activations/transients, and the KV seam are
+INT8; no fp16/bf16 tensors in training. Implemented:
+
+- **True W8A8 forward in training** (`kernels/linear.py::_W8A8Linear`):
+  INT8 operands, INT32 accumulation, fp32 scaled epilogue; STE backward on
+  quantize-dequantized operands in fp32. Head losses and the proposal top-k
+  walk run the same GEMM (`fused_train._chunk_logits`).
+- **Per-step pack caches**: weight packs key on `quant.PACK_EPOCH` (bumped
+  after every optimizer step) because masters cannot move within a step —
+  bitwise lossless, one repack per step instead of per micro-batch; device
+  moves invalidate. `KSDRAFT_PACK_PER_MICRO=1` restores old behaviour for
+  A/B. KS3 trainable cells key on (epoch, master versions).
+- **KV seam as the cache form**: stores carry int8 codes + fp16 g128 scales
+  (`ksdraft-kv-int8-v2`); the provider returns the pair; `TargetKVAttention`
+  consumes codes through INT8 score GEMMs with an STE for adapter gradients.
+  Train/serve content is the deployed int8_block_g128 grid end to end.
+- **Resume across the tier**: checkpoints load into the plain module tree
+  before conversion; KS3 masters stay trainable; optimizer slots migrate by
+  legacy names (including Adam-group reordering).
+- **Full-depth mining** (`int8-vllm/scripts/mine_ksdraft_deep.py` + worker
+  mixin): the deployed W4A8/int8-KV engine prefills each corpus pack as ONE
+  request at `max_model_len` = 1,048,576 — the engine's own chunk-carry
+  gives every position its true-prefix KV (the transformers teacher could
+  not: eager attention memory + broken chunk state). Per prefill chunk the
+  mixin streams the tapped layers' final-pass K/V (int8 grid) per TP rank
+  and each rank's LM-head top-32 plus full-vocab logsumexp; the joiner
+  merges shards into the store. Targets are raw T=1.0 logits, untruncated
+  probs (official sampling contract).
+- **Train C**: block head supervises all 16 offsets (`--block-n 16`), 1M-
+  depth store, resume from train A, in-run CE guard.
