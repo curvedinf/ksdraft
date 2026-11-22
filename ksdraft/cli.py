@@ -421,6 +421,22 @@ def _cmd_train(args: argparse.Namespace) -> int:
                               weights_only=True)
     model = KSDraftModel(cfg, teacher_dim=teacher_dim, embedding_init=emb_init,
                          head_init=head_init, transfer_space=ts_space)
+    if str(cfg.dtype).lower() == "int8":
+        # int8 doctrine: training forward runs the INT8 tier (W8A8 GEMMs).
+        # Resume weights are loaded into the PLAIN module tree first: the
+        # tier conversion replaces KS3 cells (parameter names change), so a
+        # post-conversion load with strict=False would silently drop them.
+        if getattr(args, "resume", None):
+            ck = torch.load(args.resume, map_location="cpu",
+                            weights_only=False)
+            missing, _ = model.load_state_dict(ck["model"], strict=False)
+            if missing:
+                print(f"[resume] {len(missing)} missing (fresh): "
+                      f"{missing[:3]}", flush=True)
+            print(f"[resume] weights loaded into the plain tree before "
+                  f"int8 conversion (step {ck.get('step')})", flush=True)
+        from .model import to_int8
+        model = to_int8(model, trainable_ks3=True)
     kv_provider = None
     if mined is not None:
         kv_provider = mined

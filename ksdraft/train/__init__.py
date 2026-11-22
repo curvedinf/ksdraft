@@ -244,6 +244,13 @@ class Trainer:
         self.teacher = teacher
         self.kv_provider = kv_provider
         self.sampler = sampler
+        if str(getattr(cfg, "train_dtype", "fp32")).lower() != "fp32":
+            # int8 doctrine: forward runs INT8 GEMMs, every other tensor is
+            # fp32 — no half precision anywhere in training
+            print("[train] int8 doctrine: train_dtype forced to fp32 "
+                  f"(requested {cfg.train_dtype}); no fp16/bf16 tensors",
+                  flush=True)
+            cfg.train_dtype = "fp32"
         self.cfg = cfg
         self.device = device
         self.out_dir = Path(out_dir) if out_dir else None
@@ -344,11 +351,8 @@ class Trainer:
         return c.min_lr_frac + (1 - c.min_lr_frac) * cos
 
     def _amp(self):
-        dt = str(self.cfg.train_dtype).lower()
-        if dt == "fp32" or self.device == "cpu":
-            return torch.autocast(device_type="cpu", enabled=False)
-        dtype = torch.float16 if dt == "fp16" else torch.bfloat16
-        return torch.autocast(device_type="cuda", dtype=dtype)
+        # int8 doctrine: no autocast — GEMMs are INT8, everything else fp32
+        return torch.autocast(device_type="cpu", enabled=False)
 
     def _apply_lr(self, step: int):
         scale = self._lr_scale(step)
@@ -473,7 +477,10 @@ class Trainer:
                 else (None, None)
             kv = sig.kv
             kv_dtype = torch.float16 if self.device != "cpu" else torch.float32
-            kv = tuple(t.to(self.device, kv_dtype) for t in kv)
+            # int8 codes travel as int8; scales/legacy streams as their
+            # format dtype (the cache form is never coerced through half)
+            kv = tuple(t.to(self.device) if t.dtype == torch.int8
+                       else t.to(self.device, kv_dtype) for t in kv)
             if tp is not None:
                 ti = ti.to(self.device)
                 tp = tp.to(self.device, kv_dtype)

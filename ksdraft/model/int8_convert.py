@@ -29,7 +29,8 @@ from .draft import KSDraftModel
 
 
 def to_int8(model: KSDraftModel, group: int = 128,
-            nonlinear: str = "int8") -> KSDraftModel:
+            nonlinear: str = "int8", *,
+            trainable_ks3: bool = False) -> KSDraftModel:
     # Idempotent: export and serving paths may hand over an already-converted
     # model (loaded from a tier="int8" checkpoint).
     if getattr(model, "_int8_tier", None):
@@ -47,7 +48,9 @@ def to_int8(model: KSDraftModel, group: int = 128,
             for name in ("q_proj", "k_adapter", "v_adapter", "out_proj"):
                 setattr(attn, name, Int8Linear.from_float(getattr(attn, name)))
                 n_swapped += 1
-        block.ffn = KS3Int8Cell(cell=block.ffn, group=group, nonlinear=nonlinear)
+        block.ffn = KS3Int8Cell(cell=block.ffn, group=group,
+                                nonlinear=nonlinear,
+                                trainable=trainable_ks3)
         n_swapped += 1
     if converted.teacher_proj is not None:
         converted.teacher_proj = Int8Linear.from_float(converted.teacher_proj)

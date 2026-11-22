@@ -7,10 +7,22 @@ import torch.nn.functional as F
 
 from ksdraft.kernels.fused_train import (block_position_weights, linear_ce,
                                          linear_soft_ce, wtv_from_logp)
+from ksdraft.kernels.quant import dequantize_last_dim, quantize_last_dim
+
+
+def _dq(x):
+    """Quantize-dequantize operand (identical codes/scales as the int8 path)."""
+    codes, scales = quantize_last_dim(x.detach().float())
+    return dequantize_last_dim(codes, scales)
+
+
+def _ste(x):
+    """STE identity so the int8 reference has autograd w.r.t. the masters."""
+    return _dq(x) + (x - x.detach())
 
 
 def _ref_hard(x, w, t, pw):
-    lg = (x @ w.t()).float()
+    lg = (_ste(x) @ _ste(w).t()).float()
     ce = F.cross_entropy(lg, t, reduction="none")
     return (pw * ce).sum() / pw.sum()
 
@@ -40,9 +52,12 @@ def test_hard_ce_unit_weights():
     x = torch.randn(N, D)
     w = torch.randn(V, D)
     t = torch.randint(0, V, (N,))
-    ref = F.cross_entropy(x @ w.t(), t)
+    ref = F.cross_entropy((_dq(x) @ _dq(w).t()).float(), t)
     out, _ = linear_ce(x, w, t, None, chunk=4)
-    assert torch.allclose(out, ref, atol=1e-6)
+    assert torch.allclose(out, ref, atol=1e-5)
+    # the int8 loss stays within 2% of the fp32 loss (quantization sanity)
+    fp32 = F.cross_entropy(x @ w.t(), t)
+    assert (out - fp32).abs() / fp32.abs() < 0.02
 
 
 def test_soft_ce_kl_and_wtv_grads():
@@ -54,7 +69,7 @@ def test_soft_ce_kl_and_wtv_grads():
     pt = torch.rand(N, K)
     pt = pt / pt.sum(-1, keepdim=True)
 
-    lg = (x @ w.t()).float()
+    lg = (_ste(x) @ _ste(w).t()).float()
     logp = F.log_softmax(lg, -1)
     on = logp.gather(-1, ids)
     ref = -(pt * on).sum(-1).mean() + 0.3 * wtv_from_logp(on, pt)
@@ -84,6 +99,6 @@ def test_hard_ce_fp16_gpu():
     x = torch.randn(N, D, device="cuda", dtype=torch.float16)
     w = torch.randn(V, D, device="cuda", dtype=torch.float16)
     t = torch.randint(0, V, (N,), device="cuda")
-    ref = F.cross_entropy((x @ w.t()).float(), t)
+    ref = F.cross_entropy((_dq(x) @ _dq(w).t()).float(), t)
     out, _ = linear_ce(x, w, t, None, chunk=7)
     assert torch.allclose(out, ref, atol=2e-3)

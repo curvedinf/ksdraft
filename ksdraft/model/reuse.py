@@ -64,12 +64,19 @@ class TargetKVAttention(nn.Module):
                 f"head_size={self.head_size}, kv_dim={self.kv_dim}")
 
     def forward(self, x: torch.Tensor, k_src: torch.Tensor,
-                v_src: torch.Tensor) -> torch.Tensor:
+                v_src: torch.Tensor, k_scales: torch.Tensor | None = None,
+                v_scales: torch.Tensor | None = None) -> torch.Tensor:
         if k_src is None or v_src is None:
             raise ValueError("TargetKVAttention requires target KV "
                              "(k_src, v_src); pass target_kv through the model")
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, self.n_q, self.head_size)
+        if k_src.dtype == torch.int8:
+            if k_scales is None or v_scales is None:
+                raise ValueError(
+                    "int8 KV codes require their group scales "
+                    "(k_scales, v_scales) — the cache form travels as a pair")
+            return self._forward_codes(x, q, k_src, k_scales, v_src, v_scales)
         # per-layer contract (the trunk slices taps before calling):
         # windows (B, T, W, kv_dim) — provider-aligned, dense; streams
         # (B, S, kv_dim) — full causal streams, banded window inside
@@ -78,7 +85,71 @@ class TargetKVAttention(nn.Module):
         if k_src.dim() == 3:
             return self._forward_streams(x, q, k_src, v_src)
         raise ValueError(f"target KV must be per-layer windows (B,T,W,D) "
-                         f"or streams (B,S,D); got {tuple(k_src.shape)}")
+                         f"or streams (B,S,D) or int8 codes+scales; got "
+                         f"{tuple(k_src.shape)}")
+
+    def _forward_codes(self, x, q, k_codes, k_scales, v_codes, v_scales):
+        """INT8 cache-form streams (B, S, kv_dim): codes + g128 scales.
+
+        The KV adapters consume the codes/scales directly (INT8 GEMM — the
+        operand is already the cache content, nothing is dequantized to a
+        tensor), and the attention scores run INT8 operands with INT32
+        accumulation. Softmax and the value matmul stay fp32 (nonlinear /
+        epilogue math), matching the deployed kernel design.
+        """
+        from ..kernels.gemm import w8a8_gemm
+        from ..kernels.quant import quantize_last_dim
+
+        B, S, _ = k_codes.shape
+        T = x.shape[1]
+        if S < T:
+            raise ValueError(f"KV stream ({S}) shorter than the trunk "
+                             f"window ({T})")
+        W = S - T + 1
+        k = self.k_adapter.forward_codes(
+            k_codes, k_scales).view(B, S, self.n_kv, self.head_size).float()
+        v = self.v_adapter.forward_codes(
+            v_codes, v_scales).view(B, S, self.n_kv, self.head_size).float()
+        g = self.n_q // self.n_kv
+        qg = q.float().view(B, T, self.n_kv, g, self.head_size)
+        qflat = qg.permute(0, 2, 1, 3, 4).reshape(
+            B, self.n_kv, T * g, self.head_size)
+        qc, qs = quantize_last_dim(qflat, group=self.head_size)
+        kc, ks = quantize_last_dim(
+            k.permute(0, 2, 1, 3).reshape(-1, self.head_size),
+            group=self.head_size)
+        kperm = k.permute(0, 2, 1, 3)
+        kc = kc.view(B, self.n_kv, S, self.head_size)
+        ks = ks.view(B, self.n_kv, S, 1)
+        scores = torch.empty(B, self.n_kv, T * g, S, device=x.device,
+                             dtype=torch.float32)
+        from ..kernels.quant import dequantize_last_dim
+        for b in range(B):
+            for h in range(self.n_kv):
+                s_i8 = w8a8_gemm(
+                    qc[b, h], qs[b, h], kc[b, h], ks[b, h])
+                if torch.is_grad_enabled():
+                    # STE: the value is the int8 GEMM; the gradient flows
+                    # through the dequantized operands (identity quantizer)
+                    q_dq = dequantize_last_dim(
+                        qc[b, h].float(), qs[b, h]) + (
+                            qflat[b, h] - qflat[b, h].detach())
+                    k_dq = dequantize_last_dim(
+                        kc[b, h].float(), ks[b, h]) + (
+                            kperm[b, h] - kperm[b, h].detach())
+                    s_ste = q_dq @ k_dq.t()
+                    s_i8 = s_i8.detach() + (s_ste - s_ste.detach())
+                scores[b, h] = s_i8
+        scores = scores.view(B, self.n_kv, T, g, S).permute(0, 1, 3, 2, 4)
+        scores = scores / self.head_size ** 0.5
+        mask = self._band_mask(T, S, W, x.device).view(1, 1, 1, T, S)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        p = scores.softmax(dim=-1)
+        out = torch.einsum("bkgts,bskh->bkgth", p, v)
+        out = out.permute(0, 3, 1, 2, 4).reshape(
+            B, T, self.n_q, self.head_size)
+        return self.out_proj(
+            out.reshape(B, T, self.n_q * self.head_size).to(x.dtype))
 
     def _forward_windows(self, x, q, k_src, v_src):
         """Dense provider-aligned per-layer windows (B, T, W, kv_dim) — the
@@ -177,11 +248,14 @@ class ReuseBlock(nn.Module):
         target_k: torch.Tensor | None = None,
         target_v: torch.Tensor | None = None,
         sub_prob: float = 0.0,
+        k_scales: torch.Tensor | None = None,
+        v_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if target_k is None or target_v is None:
             raise ValueError("ReuseBlock requires target KV "
                              "(target_k, target_v) at every forward")
-        h = x + self.attn(self.ln_attn(x), target_k, target_v)
+        h = x + self.attn(self.ln_attn(x), target_k, target_v,
+                          k_scales=k_scales, v_scales=v_scales)
         y = h + self.ffn(self.ln_ffn(h))
         y, feature = self.injection(y, prev_tokens, sub_prob)
         return y, feature

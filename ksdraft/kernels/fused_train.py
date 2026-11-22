@@ -28,11 +28,49 @@ from __future__ import annotations
 import torch
 
 
+_WQ_CACHE: dict = {}
+
+
+def _quantize_weight_cached(w: torch.Tensor):
+    """Quantize a projection weight once per master version.
+
+    The proposal path's top-k walk (``linear_topk``) and the head losses call
+    through here; caching keeps the 463M-parameter vocabulary head from being
+    repacked on every proposal (and every backward recompute within a step).
+    """
+    key = id(w)
+    ent = _WQ_CACHE.get(key)
+    ver = w._version
+    if ent is not None and ent[0] == ver and ent[3] is w:
+        return ent[1], ent[2]
+    from .quant import quantize_last_dim
+
+    codes, scales = quantize_last_dim(w.detach().float())
+    if len(_WQ_CACHE) > 8:
+        _WQ_CACHE.clear()
+    _WQ_CACHE[key] = (ver, codes, scales, w)
+    return codes, scales
+
+
 def _chunk_logits(x: torch.Tensor, w: torch.Tensor, chunk: int):
+    """Chunked vocab projection through the INT8 W8A8 GEMM.
+
+    Activations are quantized per token (g128) and the head rows per output
+    (g128, cached per master version); each chunk runs INT8 operands with
+    INT32 accumulation and an fp32 scaled epilogue. Backward re-enters this
+    helper to rebuild the exact forward logits for its softmax, which stays
+    bit-consistent because quantization and GEMM are deterministic.
+    """
+    from .gemm import w8a8_gemm
+    from .quant import quantize_last_dim
+
+    a_codes, a_scales = quantize_last_dim(x.float())
+    w_codes, w_scales = _quantize_weight_cached(w)
     n = x.shape[0]
     for s in range(0, n, chunk):
         e = min(s + chunk, n)
-        yield s, e, x[s:e] @ w.t()
+        yield s, e, w8a8_gemm(a_codes[s:e], a_scales[s:e],
+                              w_codes, w_scales)
 
 
 def _weights(pos_weight: torch.Tensor | None, n: int, device,
@@ -94,6 +132,12 @@ class _LinearCE(torch.autograd.Function):
     def backward(ctx, grad_loss, grad_per_pos):
         x, wf, w, targets, wgt = ctx.saved_tensors
         n, d = x.shape
+        from .quant import dequantize_last_dim, quantize_last_dim
+
+        # STE: the matmuls run on the quantize-dequantized operands (the
+        # forward function's own values), gradients hand off in fp32
+        xq = dequantize_last_dim(*quantize_last_dim(x.float()))
+        wq = dequantize_last_dim(*quantize_last_dim(wf.float()))
         need_dw = getattr(ctx, "need_dw", True)
         dw = (torch.zeros(w.shape, device=w.device, dtype=torch.float32)
               if need_dw else None)
@@ -107,8 +151,8 @@ class _LinearCE(torch.autograd.Function):
             q.mul_(wgt[s:e, None] * g)
             dlog_all[s:e] = q.to(x.dtype)
             if need_dw:
-                dw = dw + (dlog_all[s:e].t() @ x[s:e]).float()
-        dx = _k_chunked_dx(dlog_all, wf)
+                dw = dw + (dlog_all[s:e].t() @ xq[s:e]).float()
+        dx = _k_chunked_dx(dlog_all, wq)
         return dx, (dw.to(w.dtype) if need_dw else None), None, None, None, None
 
 
@@ -141,6 +185,10 @@ class _LinearSoftCE(torch.autograd.Function):
     def backward(ctx, grad_loss, grad_topk):
         x, wf, w, ids, p_t, wgt = ctx.saved_tensors
         n, d = x.shape
+        from .quant import dequantize_last_dim, quantize_last_dim
+
+        xq = dequantize_last_dim(*quantize_last_dim(x.float()))
+        wq = dequantize_last_dim(*quantize_last_dim(wf.float()))
         need_dw = getattr(ctx, "need_dw", True)
         dw = (torch.zeros(w.shape, device=w.device, dtype=torch.float32)
               if need_dw else None)
@@ -160,8 +208,8 @@ class _LinearSoftCE(torch.autograd.Function):
                 dlog.scatter_add_(-1, ids[s:e], gt)
             dlog_all[s:e] = dlog.to(x.dtype)
             if need_dw:
-                dw = dw + (dlog_all[s:e].t() @ x[s:e]).float()
-        dx = _k_chunked_dx(dlog_all, wf)
+                dw = dw + (dlog_all[s:e].t() @ xq[s:e]).float()
+        dx = _k_chunked_dx(dlog_all, wq)
         return (dx, (dw.to(w.dtype) if need_dw else None), None, None, None,
                 None, None)
 

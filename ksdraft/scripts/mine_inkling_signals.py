@@ -170,7 +170,7 @@ def main() -> int:
 
     TAPS = list(args.taps)
 
-    from ksdraft.teacher import emulate_int8_kv
+    from ksdraft.teacher import blocks_int8_kv
 
     corpus = Path(args.corpus)
     tokens = torch.load(corpus / "tokens.pt", weights_only=True).long()
@@ -182,11 +182,13 @@ def main() -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     L = len(TAPS)
-    # Streams are ~16KB/token (4 taps x 1024 x 2B x K/V): far beyond RAM at
-    # multi-million-token scale, so rows stream to disk per chunk instead of
-    # materializing. topk tensors stay in RAM (6B/token).
-    k_f = open(out / "k_stream.bin", "wb")
-    v_f = open(out / "v_stream.bin", "wb")
+    # Store v2 = the cache form itself: int8 codes + fp16 g128 scales per
+    # tap. 13GB/stream of codes + 200MB scales (half the fp16-container
+    # size), and the trainer consumes codes through INT8 GEMMs directly.
+    kc_f = open(out / "k_codes.bin", "wb")
+    ks_f = open(out / "k_scales.bin", "wb")
+    vc_f = open(out / "v_codes.bin", "wb")
+    vs_f = open(out / "v_scales.bin", "wb")
     ti_mm = torch.empty((total, TOPK), dtype=torch.int32)
     tp_mm = torch.empty((total, TOPK), dtype=torch.float16)
 
@@ -205,24 +207,34 @@ def main() -> int:
             tp, ti = probs.topk(TOPK, dim=-1)
             ti_mm[lo:hi] = ti.cpu()
             tp_mm[lo:hi] = tp.half().cpu()
-            k_rows = torch.empty((hi - lo, L, 1024), dtype=torch.float16)
-            v_rows = torch.empty((hi - lo, L, 1024), dtype=torch.float16)
+            kc_rows = torch.empty((hi - lo, L, 1024), dtype=torch.int8)
+            ks_rows = torch.empty((hi - lo, L, 8), dtype=torch.float16)
+            vc_rows = torch.empty((hi - lo, L, 1024), dtype=torch.int8)
+            vs_rows = torch.empty((hi - lo, L, 8), dtype=torch.float16)
             for i, layer in enumerate(TAPS):
-                for j, name in enumerate(("k", "v")):
+                for name in ("k", "v"):
                     t = hooks.captured[(layer, f"{name}_proj")]
-                    grid = emulate_int8_kv(t.float().cpu())
-                    (k_rows if name == "k" else v_rows)[
-                        :, i] = grid.half()
-            k_f.write(k_rows.numpy().tobytes())
-            v_f.write(v_rows.numpy().tobytes())
+                    codes, scales = blocks_int8_kv(t.float().cpu())
+                    if name == "k":
+                        kc_rows[:, i] = codes
+                        ks_rows[:, i] = scales
+                    else:
+                        vc_rows[:, i] = codes
+                        vs_rows[:, i] = scales
+            kc_f.write(kc_rows.numpy().tobytes())
+            ks_f.write(ks_rows.numpy().tobytes())
+            vc_f.write(vc_rows.numpy().tobytes())
+            vs_f.write(vs_rows.numpy().tobytes())
             if c % args.report_every == 0 or c == n_chunks - 1:
                 done = hi
                 rate = done / max(1e-9, time.time() - t0)
                 print(f"chunk {c + 1}/{n_chunks}: {done:,}/{total:,} tokens "
                       f"({rate:,.0f} tok/s)", flush=True)
 
-    k_f.close()
-    v_f.close()
+    kc_f.close()
+    ks_f.close()
+    vc_f.close()
+    vs_f.close()
     torch.save(ti_mm, out / "topk_ids.pt")
     torch.save(tp_mm, out / "topk_probs.pt")
     b = bounds[bounds <= total]
@@ -230,9 +242,10 @@ def main() -> int:
     (out / "meta.json").write_text(json.dumps({
         "source": str(args.source), "corpus": str(corpus),
         "tokens": int(total), "taps": TAPS, "topk": TOPK,
-        "kv_grid": "int8_block_g128 emulation (fork kernel semantics)",
-        "elapsed_s": round(time.time() - t0, 1),
-        "stream_dtype": "fp16", "kv_bytes_per_token": L * 1024 * 4}, indent=2))
+        "format": "ksdraft-kv-int8-v2",
+        "kv_grid": "int8_block_g128 codes+scales (fork kernel semantics)",
+        "codes_dtype": "int8", "scales_dtype": "fp16", "group": 128,
+        "elapsed_s": round(time.time() - t0, 1)}, indent=2))
     print(f"saved {total:,} positions of 4-tap KV + top-{TOPK} -> {out}",
           flush=True)
     return 0

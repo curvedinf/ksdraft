@@ -140,13 +140,18 @@ class KSDraftModel(nn.Module):
                 teacher_states.to(self.teacher_proj.weight.dtype))
 
         k_src = v_src = None
+        k_scales = v_scales = None
         if self.config.kv_dim:
             if target_kv is None:
                 raise ValueError(
                     "kv_dim > 0 (reuse backbone) requires target_kv=(k, v) "
                     "at every forward — pass a KV provider through the trainer "
                     "or the serving seam")
-            k_src, v_src = target_kv
+            if len(target_kv) == 4:
+                # int8 cache form: (k_codes, k_scales, v_codes, v_scales)
+                k_src, k_scales, v_src, v_scales = target_kv
+            else:
+                k_src, v_src = target_kv
             if k_src.shape[1] != len(self.blocks):
                 raise ValueError(
                     f"target_kv carries {k_src.shape[1]} layer taps but the "
@@ -160,8 +165,10 @@ class KSDraftModel(nn.Module):
         features = []
         for i, block in enumerate(self.blocks):
             if k_src is not None:
-                x, feature = block(x, prev_tokens, k_src[:, i], v_src[:, i],
-                                   sub_prob)
+                x, feature = block(
+                    x, prev_tokens, k_src[:, i], v_src[:, i], sub_prob,
+                    k_scales=(k_scales[:, i] if k_scales is not None else None),
+                    v_scales=(v_scales[:, i] if v_scales is not None else None))
             else:
                 x, feature = block(x, prev_tokens, sub_prob)
             features.append(feature)

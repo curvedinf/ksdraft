@@ -29,14 +29,36 @@ class MinedSignals(TeacherClient):
         self.window = int(window)
         self.n_taps = self.layers
         self.seed = seed
-        self.k = self._load_stream(store, "k_stream")
-        self.v = self._load_stream(store, "v_stream")
+        self.v2 = meta.get("format") == "ksdraft-kv-int8-v2"
+        if self.v2:
+            # int8 cache form: codes + g128 scales, no dequantized tensor
+            self.k = self._load_codes(store, "k_codes")
+            self.ks = self._load_scales(store, "k_scales")
+            self.v = self._load_codes(store, "v_codes")
+            self.vs = self._load_scales(store, "v_scales")
+        else:
+            self.k = self._load_stream(store, "k_stream")
+            self.v = self._load_stream(store, "v_stream")
         self.ti = torch.load(store / "topk_ids.pt", weights_only=True,
                              mmap=True)
         self.tp = torch.load(store / "topk_probs.pt", weights_only=True,
                              mmap=True)
         self.bounds = torch.load(store / "boundaries.pt", weights_only=True)
         self._starts = None  # set per-batch by the trainer
+
+    def _load_codes(self, store: Path, stem: str) -> torch.Tensor:
+        meta = json.loads((store / "meta.json").read_text())
+        rows, taps = int(meta["tokens"]), len(meta["taps"])
+        return torch.from_file(
+            str(store / f"{stem}.bin"), shared=False, size=rows * taps * 1024,
+            dtype=torch.int8).view(rows, taps, 1024)
+
+    def _load_scales(self, store: Path, stem: str) -> torch.Tensor:
+        meta = json.loads((store / "meta.json").read_text())
+        rows, taps = int(meta["tokens"]), len(meta["taps"])
+        return torch.from_file(
+            str(store / f"{stem}.bin"), shared=False, size=rows * taps * 8,
+            dtype=torch.float16).view(rows, taps, 8)
 
     def _load_stream(self, store: Path, stem: str) -> torch.Tensor:
         pt = store / f"{stem}.pt"
@@ -75,10 +97,19 @@ class MinedSignals(TeacherClient):
         # back their causal span, clamped at the document start (repetition)
         pos = (starts + T_in - 1)[:, None] - (S - 1 - idx)[None, :]
         pos = torch.maximum(pos, span_lo[:, None])
-        k = self.k[pos.cpu()]                              # (B, S, L, D)
-        v = self.v[pos.cpu()]
-        kv = (k.permute(0, 2, 1, 3).to(device, torch.float16),
-              v.permute(0, 2, 1, 3).to(device, torch.float16))
+        cpu_pos = pos.cpu()
+        if self.v2:
+            # codes ride to the device as int8; scales as their fp16 format
+            kc = self.k[cpu_pos].permute(0, 2, 1, 3).to(device)
+            ks = self.ks[cpu_pos].permute(0, 2, 1, 3).to(device)
+            vc = self.v[cpu_pos].permute(0, 2, 1, 3).to(device)
+            vs = self.vs[cpu_pos].permute(0, 2, 1, 3).to(device)
+            kv = (kc, ks, vc, vs)
+        else:
+            k = self.k[cpu_pos]                            # (B, S, L, D)
+            v = self.v[cpu_pos]
+            kv = (k.permute(0, 2, 1, 3).to(device, torch.float16),
+                  v.permute(0, 2, 1, 3).to(device, torch.float16))
         rows = starts[:, None] + torch.arange(T_in, device=device)[None, :]
         ti = self.ti[rows.cpu()].to(device)
         tp = self.tp[rows.cpu()].to(device, torch.float16)

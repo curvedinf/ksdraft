@@ -41,6 +41,33 @@ def fixture_kv_stream(tokens: torch.Tensor, layers: int, kv_dim: int,
     return out
 
 
+def blocks_int8_kv(stream: torch.Tensor,
+                   group: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    """Round a KV stream onto the deployed int8_block_g128 grid: codes+scales.
+
+    Returns (codes int8 (..., Dp) trimmed to D, scales fp16 (..., Dp/group))
+    with the fork cache-write kernel's exact semantics (see emulate_int8_kv).
+    This is the int8 transport form of the KV seam: nothing here is ever
+    materialized as a dequantized fp16 tensor.
+    """
+    shape = stream.shape
+    D = shape[-1]
+    dpad = (-D) % group
+    x = stream.detach().float().reshape(-1, D)
+    if dpad:
+        x = torch.nn.functional.pad(x, (0, dpad))
+    blocks = x.view(-1, (D + dpad) // group, group)
+    amax = blocks.abs().amax(dim=-1)
+    scale = (amax / 127.0).clamp_min(1e-6)
+    scale = scale.to(torch.float16).to(torch.float32)
+    q = blocks / scale.unsqueeze(-1)
+    q = torch.where(q >= 0, q + 0.5, q - 0.5).trunc()   # half away from zero
+    q = q.clamp_(-128.0, 127.0)
+    codes = q.reshape(-1, D + dpad)[:, :D].to(torch.int8).view(shape)
+    scales = scale.to(torch.float16).view(*shape[:-1], (D + dpad) // group)
+    return codes, scales
+
+
 def emulate_int8_kv(stream: torch.Tensor, group: int = 128) -> torch.Tensor:
     """Round a KV stream onto the deployed int8_block_g128 grid.
 
@@ -59,19 +86,23 @@ def emulate_int8_kv(stream: torch.Tensor, group: int = 128) -> torch.Tensor:
     Grouping runs along the flat channel dim: for Inkling's 8 KV heads of
     128 the group boundaries coincide with the kernel's per-head vectors.
     """
-    flat = stream.detach().float().reshape(-1)
-    n = flat.numel()
-    pad = (-n) % group
-    if pad:
-        flat = torch.cat([flat, flat.new_zeros(pad)])
-    blocks = flat.view(-1, group)
-    amax = blocks.abs().amax(dim=1)
-    scale = (amax / 127.0).clamp_min(1e-6)
-    scale = scale.to(torch.float16).to(torch.float32)
-    q = blocks / scale.unsqueeze(1)
-    q = torch.where(q >= 0, q + 0.5, q - 0.5).trunc()   # half away from zero
-    q = q.clamp_(-128.0, 127.0)
-    return (q * scale.unsqueeze(1)).reshape(-1)[:n].view_as(stream)
+    codes, scales = blocks_int8_kv(stream, group)
+    return dequant_kv(codes, scales, group)
+
+
+def dequant_kv(codes: torch.Tensor, scales: torch.Tensor,
+               group: int = 128) -> torch.Tensor:
+    """Inverse of blocks_int8_kv (exact on the codes it produced)."""
+    shape = codes.shape
+    D = shape[-1]
+    dpad = (-D) % group
+    x = codes.reshape(-1, D).float()
+    if dpad:
+        x = torch.nn.functional.pad(x, (0, dpad))
+    g = x.view(-1, (D + dpad) // group, group)
+    s = scales.float().reshape(-1, (D + dpad) // group, 1)
+    dq = (g * s).reshape(-1, D + dpad)[:, :D].view(shape)
+    return dq
 
 
 def causal_kv_windows(stream: torch.Tensor, window: int) -> torch.Tensor:
