@@ -370,6 +370,10 @@ def _cmd_train(args: argparse.Namespace) -> int:
             window=int(getattr(args, "kv_window", None) or cfg.kv_window))
         print(f"kv: mined store {args.kv_store} "
               f"(W={mined.window}, positioned)", flush=True)
+        # the store's document boundaries are the context resets the rows
+        # were mined under; they win over the corpus file's own marks
+        if getattr(mined, "bounds", None) is not None and mined.bounds.numel():
+            bounds = mined.bounds
         # sampling must stay inside the store's coverage
         n_cov = int(mined.k.shape[0])
         if len(ids) > n_cov:
