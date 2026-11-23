@@ -84,7 +84,10 @@ def w8a8_gemm(
     y = torch.empty((M, N), device=a_codes.device, dtype=torch.float32)
     BM, BN = 16, 64
     grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
+    # The kernel uses packed row strides. A single tap from a mined KV
+    # stream can still have the other taps interleaved between its rows.
     _w8a8_gemm_kernel[grid](
-        a_codes, a_scales, w_codes, w_scales, y,
+        a_codes.contiguous(), a_scales.contiguous(),
+        w_codes.contiguous(), w_scales.contiguous(), y,
         M, N, K, BM, BN, group, num_warps=4)
     return y

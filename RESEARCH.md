@@ -1164,7 +1164,7 @@ old draft-round latency driver). Trunk is ~85% KS3, attention 15%.
   (`shared_embedding` + `shared_head`); `load_export(embedding=, head=)`
   binds them.
 - **KS3 fast path** (`ksdraft/kernels/ks3_wr.py`): vendored from the
-  world-record package (`~/modded-nanogpt-ks3-pr/track_1_short/ks3/`,
+  reference package (`~/modded-nanogpt-ks3-pr/track_1_short/ks3/`,
   k-splanifolds CC-BY-SA-4.0 lineage — licensing is the owner's call).
   Adds what the old fused path lacked: GS32 activation quantization
   during training, in-kernel int8 coefficient grids (forward + VJP), the

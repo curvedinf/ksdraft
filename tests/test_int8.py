@@ -91,6 +91,19 @@ def _run_gpu(a_codes, a_scales, w_codes, w_scales):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no GPU")
+def test_gemm_reads_one_tap_from_interleaved_kv_rows():
+    from ksdraft.kernels.gemm import w8a8_gemm
+
+    torch.manual_seed(5)
+    codes, scales = quantize_last_dim(torch.randn(33, 4, 256, device="cuda"))
+    weights, weight_scales = quantize_last_dim(torch.randn(65, 256, device="cuda"))
+    tap, tap_scales = codes[:, 2], scales[:, 2]
+    expected = w8a8_gemm(tap.contiguous(), tap_scales.contiguous(), weights, weight_scales)
+    actual = w8a8_gemm(tap, tap_scales, weights, weight_scales)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no GPU")
 def test_int8_linear_gpu_vs_cpu():
     torch.manual_seed(4)
     dev = torch.device("cuda")

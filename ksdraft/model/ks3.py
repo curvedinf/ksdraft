@@ -106,7 +106,7 @@ class KS3(nn.Module):
             if wr_enabled(x):
                 # WR fast path (2026-11-22): GS32 activation grids, in-kernel
                 # int8 coefficient grid, NL-mode Horner, fused VJP — the
-                # world-record lineage numerics, dense adaptation.
+                # reference lineage numerics, dense adaptation.
                 return ks3_wr_forward(x, self)
         coordinates = self.down(x)
         if self.subspace_rank == 1:

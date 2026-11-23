@@ -1,6 +1,6 @@
 """Vendored WR KS3 kernels, dense adaptation for ksdraft (2026-11-22).
 
-Source: ~/modded-nanogpt-ks3-pr/track_1_short/ks3/ (the world-record
+Source: ~/modded-nanogpt-ks3-pr/track_1_short/ks3/ (the reference
 speedrun package), geometry lineage curvedinf/k-splanifolds @ ea7a9c1
 (CC-BY-SA-4.0 — see the source checkout's LICENSE.k-splanifolds; ksdraft
 is MIT, so this file keeps the provenance note and the user (owner of both

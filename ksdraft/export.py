@@ -92,6 +92,9 @@ def export_model(model: KSDraftModel, out_dir: str,
         sd.pop("embedding.weight", None)
         if not c.tie_word_embeddings:
             sd.pop("head.weight", None)
+        # the DSpine transfer table is target-derived support for the proposal
+        # walk, not a drafter weight; it does not ship
+        sd.pop("transfer_C", None)
     try:
         from safetensors.torch import save_file
         save_file(sd, str(out / "ksdraft.safetensors"),
