@@ -22,7 +22,7 @@
 
   <rect x="0" y="0" width="1400" height="1000" fill="#ffffff"/>
 
-  <text x="700" y="44" text-anchor="middle" class="title">KSDraft — DFly2-style target-KV reuse drafter</text>
+  <text x="700" y="44" text-anchor="middle" class="title">KSDraft — target-KV reuse drafter</text>
   <text x="700" y="74" text-anchor="middle" class="subtitle">target-frozen tables + int8 g128 KV taps → 4-layer draft trunk → parallel block head</text>
 
   <!-- ================= target model (frozen, external) ================= -->
@@ -94,7 +94,7 @@
   <text x="645" y="510" text-anchor="middle" class="box-title">LN</text>
   <path d="M 690 505 H 708" class="arrow"/>
   <rect x="710" y="475" width="230" height="60" rx="8" fill="#ccfbf1" stroke="#0f766e" stroke-width="1.5"/>
-  <text x="825" y="498" text-anchor="middle" class="box-title">KS3 decoder</text>
+  <text x="825" y="498" text-anchor="middle" class="box-title">spine decoder</text>
   <text x="825" y="518" text-anchor="middle" class="box-sub">down → Horner spine → ReLU² → up</text>
   <path d="M 940 505 H 969" class="arrow"/>
   <circle cx="985" cy="505" r="14" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
@@ -105,11 +105,11 @@
   <path d="M 590 505 V 545 H 985 V 521" class="arrow"/>
   <text x="690" y="557" class="small">h (residual)</text>
 
-  <!-- row 3: DSpine injection -->
+  <!-- row 3: adjacent injection -->
   <path d="M 999 505 H 1048 V 602 H 1042" class="arrow"/>
   <text x="1054" y="560" class="flow">y</text>
   <rect x="610" y="570" width="440" height="64" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="1.5"/>
-  <text x="830" y="594" text-anchor="middle" class="box-title">DSpine AdjacentInjection</text>
+  <text x="830" y="594" text-anchor="middle" class="box-title">AdjacentInjection</text>
   <text x="830" y="614" text-anchor="middle" class="small">gate σ(Gq·z_t + Gp·z_{t−1} + b) · A·z_{t−1} → W write; R readout</text>
 
   <path d="M 830 634 V 697" class="arrow"/>
