@@ -22,14 +22,6 @@ Architecture:
   selector + last-write refinement) —
   [DFlash](https://arxiv.org/abs/2602.06036),
   [DFlash2 card](https://docs.nvidia.com/nemo/automodel/nemo_automodel/nemo_automodel/components/speculative/dflash/draft_qwen3_dflash2.md)
-- **Split Muon + 8-bit AdamW** (block-wise int8 m/√v) —
-  [Muon](https://kellerjordan.github.io/posts/muon/),
-  [Muon scaling](https://arxiv.org/abs/2502.16982),
-  [8-bit optimizers](https://arxiv.org/abs/2110.02861),
-  [modded-nanogpt reference](https://github.com/KellerJordan/modded-nanogpt)
-- **PTQR rounding-dither annealing** to the INT8 serving tier
-  ([draft card](https://huggingface.co/curvedinf/Qwen3.8-27B-DFlash2-GPTQ-INT8-W8A8-GS128-PTQR),
-  [int8-vllm](https://github.com/curvedinf/int8-vllm))
 
 Status: implementation in progress; no training runs yet. The full
 architecture research, decisions, and audits live in
