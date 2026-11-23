@@ -55,39 +55,7 @@ dequant stay exact.
 
 ## Block diagram
 
-```
-              +---------------------------------------------------+
-              |  target model (frozen, external)                   |
-              |  embedding [V,d]              unembed [V,d]        |
-              +------+--------------------------------+---------+
-                     | token ids                      | logits
-                     v                                |
-+-----------------------------------------------------------------------+
-|  draft trunk                                                          |
-|                                                                       |
-|    x = LN_in(embed[tokens])                                           |
-|                                                                       |
-|    layer 0..N-1:                                                      |
-|      target K/V tap (int8 g128 codes + scales, one per layer)         |
-|               |                                                       |
-|               v                                                       |
-|      x --> LN --> TargetKVAttention --+--> h                          |
-|               Q from the draft, K/V adapters from the tap             |
-|      h --> LN --> KS3 (down -> Horner spine -> ReLU^2 -> up) --+--> y |
-|      y --> DSpine AdjacentInjection (gate on the previous position)   |
-|                                                                       |
-|    h_out = LN_out(x)                                                  |
-+-----------------------------------------------------------------------+
-                                   | anchor = h_out[:, -1]
-                                   v
-                     +------------------------------+
-                     | block head                   |
-                     | hs_k = BlockConv(anchor +    |
-                     |        block_delta_k)        |
-                     | logits_k = hs_k @ unembed^T  |
-                     | greedy walk over offsets     |
-                     +------------------------------+
-```
+![KSDraft block diagram](assets/block-diagram.svg)
 
 ## Install
 
