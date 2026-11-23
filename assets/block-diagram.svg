@@ -1,146 +1,121 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1000" width="1400" height="1000" role="img" aria-label="KSDraft block diagram">
   <style>
-    .title { font: 700 26px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #0f172a; }
-    .subtitle { font: 400 14px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
-    .panel { font: 700 15px ui-sans-serif, system-ui, sans-serif; }
-    .box-title { font: 700 14px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
-    .box-sub { font: 400 11px ui-sans-serif, system-ui, sans-serif; fill: #64748b; }
-    .flow { font: italic 12px ui-sans-serif, system-ui, sans-serif; fill: #334155; }
-    .small { font: 400 10.5px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
-    .arrow { stroke: #334155; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
-    .target-arrow { stroke: #7c3aed; stroke-width: 1.8; fill: none; stroke-dasharray: 7 5; marker-end: url(#arrow-purple); }
+    .title { font: 700 32px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #0f172a; }
+    .subtitle { font: 400 18px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
+    .panel { font: 700 18px ui-sans-serif, system-ui, sans-serif; }
+    .box { font: 700 17px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+    .arrow { stroke: #334155; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    .target-arrow { stroke: #7c3aed; stroke-width: 2; fill: none; stroke-dasharray: 8 6; marker-end: url(#arrow-purple); }
   </style>
 
   <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
     </marker>
-    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
     </marker>
   </defs>
 
   <rect x="0" y="0" width="1400" height="1000" fill="#ffffff"/>
 
-  <text x="700" y="44" text-anchor="middle" class="title">KSDraft — target-KV reuse drafter</text>
-  <text x="700" y="74" text-anchor="middle" class="subtitle">target-frozen tables + int8 g128 KV taps → 4-layer draft trunk → parallel block head</text>
+  <text x="700" y="58" text-anchor="middle" class="title">KSDraft</text>
+  <text x="700" y="92" text-anchor="middle" class="subtitle">target-KV reuse drafter</text>
 
-  <!-- ================= target model (frozen, external) ================= -->
-  <rect x="40" y="110" width="360" height="820" rx="16" fill="#faf5ff" stroke="#7c3aed" stroke-width="2" stroke-dasharray="8 6"/>
-  <text x="220" y="145" text-anchor="middle" class="panel" fill="#6d28d9">target model (frozen, external)</text>
+  <!-- target model -->
+  <rect x="50" y="140" width="380" height="850" rx="18" fill="#faf5ff" stroke="#7c3aed" stroke-width="2" stroke-dasharray="9 7"/>
+  <text x="240" y="180" text-anchor="middle" class="panel" fill="#6d28d9">Target model (frozen)</text>
 
-  <rect x="70" y="175" width="300" height="74" rx="10" fill="#ffffff" stroke="#a78bfa" stroke-width="1.5"/>
-  <text x="220" y="205" text-anchor="middle" class="box-title">embedding table</text>
-  <text x="220" y="228" text-anchor="middle" class="box-sub">[V, d] token rows</text>
+  <rect x="80" y="220" width="320" height="90" rx="12" fill="#ffffff" stroke="#a78bfa" stroke-width="2"/>
+  <text x="240" y="273" text-anchor="middle" class="box">Embedding table</text>
 
-  <rect x="70" y="310" width="300" height="130" rx="10" fill="#ffffff" stroke="#a78bfa" stroke-width="1.5"/>
-  <text x="220" y="340" text-anchor="middle" class="box-title">target KV cache</text>
-  <text x="220" y="364" text-anchor="middle" class="box-sub">int8 g128 codes + fp16 scales</text>
-  <text x="220" y="388" text-anchor="middle" class="box-sub">one tap per draft layer</text>
-  <text x="220" y="412" text-anchor="middle" class="box-sub">never written by the drafter</text>
+  <rect x="80" y="390" width="320" height="110" rx="12" fill="#ffffff" stroke="#a78bfa" stroke-width="2"/>
+  <text x="240" y="453" text-anchor="middle" class="box">KV cache (int8 g128)</text>
 
-  <rect x="70" y="760" width="300" height="74" rx="10" fill="#ffffff" stroke="#a78bfa" stroke-width="1.5"/>
-  <text x="220" y="790" text-anchor="middle" class="box-title">unembed table</text>
-  <text x="220" y="813" text-anchor="middle" class="box-sub">[V, d] output rows</text>
+  <rect x="80" y="700" width="320" height="90" rx="12" fill="#ffffff" stroke="#a78bfa" stroke-width="2"/>
+  <text x="240" y="753" text-anchor="middle" class="box">Unembed table</text>
 
-  <!-- ================= draft trunk ================= -->
-  <rect x="520" y="110" width="560" height="820" rx="16" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
-  <text x="800" y="145" text-anchor="middle" class="panel" fill="#1d4ed8">draft trunk — 4 × ReuseBlock (no drafter KV cache)</text>
+  <!-- draft trunk -->
+  <rect x="500" y="140" width="580" height="850" rx="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="790" y="180" text-anchor="middle" class="panel" fill="#1d4ed8">Draft trunk</text>
 
-  <rect x="560" y="245" width="140" height="50" rx="8" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
-  <text x="630" y="275" text-anchor="middle" class="box-title">tokens</text>
+  <rect x="560" y="320" width="170" height="70" rx="10" fill="#ffffff" stroke="#334155" stroke-width="2"/>
+  <text x="645" y="363" text-anchor="middle" class="box">Tokens</text>
 
-  <path d="M 700 270 H 730 V 220 H 758" class="arrow"/>
+  <path d="M 730 355 H 760 V 285 H 788" class="arrow"/>
 
-  <rect x="760" y="175" width="180" height="50" rx="8" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
-  <text x="850" y="205" text-anchor="middle" class="box-title">embedding lookup</text>
+  <rect x="790" y="220" width="230" height="70" rx="10" fill="#ffffff" stroke="#334155" stroke-width="2"/>
+  <text x="905" y="263" text-anchor="middle" class="box">Embedding lookup</text>
 
-  <path d="M 370 212 H 758" class="target-arrow"/>
-  <text x="462" y="200" text-anchor="middle" class="small" fill="#7c3aed">rows</text>
+  <path d="M 400 255 H 788" class="target-arrow"/>
 
-  <path d="M 850 225 V 262" class="arrow"/>
-  <rect x="760" y="265" width="180" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
-  <text x="850" y="295" text-anchor="middle" class="box-title">LayerNorm_in</text>
-  <path d="M 850 315 V 347" class="arrow"/>
+  <path d="M 905 290 V 328" class="arrow"/>
+  <rect x="790" y="330" width="230" height="70" rx="10" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+  <text x="905" y="373" text-anchor="middle" class="box">LayerNorm</text>
+  <path d="M 905 400 V 428" class="arrow"/>
 
-  <!-- stacked ReuseBlock x4 -->
-  <rect x="576" y="366" width="500" height="330" rx="12" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
-  <rect x="568" y="358" width="500" height="330" rx="12" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
-  <rect x="560" y="350" width="500" height="330" rx="12" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
-  <text x="810" y="380" text-anchor="middle" class="panel" fill="#1d4ed8">ReuseBlock × 4</text>
+  <!-- reuse block stack -->
+  <rect x="556" y="446" width="500" height="410" rx="14" fill="#dbeafe" stroke="#93c5fd" stroke-width="2"/>
+  <rect x="548" y="438" width="500" height="410" rx="14" fill="#dbeafe" stroke="#93c5fd" stroke-width="2"/>
+  <rect x="540" y="430" width="500" height="410" rx="14" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+  <text x="790" y="470" text-anchor="middle" class="panel" fill="#1d4ed8">ReuseBlock × 4</text>
 
-  <!-- row 1: attention -->
-  <text x="578" y="425" class="flow">x</text>
-  <path d="M 590 420 H 598" class="arrow"/>
-  <rect x="600" y="398" width="90" height="44" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
-  <text x="645" y="425" text-anchor="middle" class="box-title">LN</text>
-  <path d="M 690 420 H 708" class="arrow"/>
-  <rect x="710" y="392" width="230" height="56" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
-  <text x="825" y="415" text-anchor="middle" class="box-title">TargetKVAttention</text>
-  <text x="825" y="435" text-anchor="middle" class="box-sub">Q from draft · K/V adapters from the tap</text>
-  <path d="M 940 420 H 969" class="arrow"/>
-  <circle cx="985" cy="420" r="14" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
-  <text x="985" y="425" text-anchor="middle" class="box-title">+</text>
-  <path d="M 999 420 H 1020" class="arrow"/>
-  <text x="1030" y="425" class="flow">h</text>
+  <rect x="580" y="490" width="160" height="60" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+  <text x="660" y="528" text-anchor="middle" class="box">LayerNorm</text>
 
-  <path d="M 592 420 V 360 H 985 V 404" class="arrow"/>
-  <text x="690" y="372" class="small">x (residual)</text>
+  <path d="M 740 520 H 778" class="arrow"/>
 
-  <!-- row 2: KS3 -->
-  <path d="M 985 434 V 462 H 590 V 505 H 598" class="arrow"/>
-  <text x="994" y="456" class="flow">h</text>
-  <rect x="600" y="483" width="90" height="44" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
-  <text x="645" y="510" text-anchor="middle" class="box-title">LN</text>
-  <path d="M 690 505 H 708" class="arrow"/>
-  <rect x="710" y="475" width="230" height="60" rx="8" fill="#ccfbf1" stroke="#0f766e" stroke-width="1.5"/>
-  <text x="825" y="498" text-anchor="middle" class="box-title">spine decoder</text>
-  <text x="825" y="518" text-anchor="middle" class="box-sub">down → Horner spine → ReLU² → up</text>
-  <path d="M 940 505 H 969" class="arrow"/>
-  <circle cx="985" cy="505" r="14" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
-  <text x="985" y="510" text-anchor="middle" class="box-title">+</text>
-  <path d="M 999 505 H 1020" class="arrow"/>
-  <text x="1030" y="510" class="flow">y</text>
+  <rect x="780" y="480" width="200" height="80" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="880" y="527" text-anchor="middle" class="box">Target-KV Attention</text>
 
-  <path d="M 590 505 V 545 H 985 V 521" class="arrow"/>
-  <text x="690" y="557" class="small">h (residual)</text>
+  <path d="M 980 520 H 1000" class="arrow"/>
+  <circle cx="1015" cy="520" r="15" fill="#ffffff" stroke="#334155" stroke-width="2"/>
+  <text x="1015" y="526" text-anchor="middle" class="box">+</text>
 
-  <!-- row 3: adjacent injection -->
-  <path d="M 999 505 H 1048 V 602 H 1042" class="arrow"/>
-  <text x="1054" y="560" class="flow">y</text>
-  <rect x="610" y="570" width="440" height="64" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="1.5"/>
-  <text x="830" y="594" text-anchor="middle" class="box-title">AdjacentInjection</text>
-  <text x="830" y="614" text-anchor="middle" class="small">gate σ(Gq·z_t + Gp·z_{t−1} + b) · A·z_{t−1} → W write; R readout</text>
+  <path d="M 570 520 V 482 H 1015 V 503" class="arrow"/>
 
-  <path d="M 830 634 V 697" class="arrow"/>
-  <text x="840" y="670" class="flow">y′</text>
+  <path d="M 1015 535 V 590 H 570 V 630 H 578" class="arrow"/>
 
-  <rect x="740" y="700" width="180" height="50" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
-  <text x="830" y="730" text-anchor="middle" class="box-title">LayerNorm_out</text>
-  <path d="M 830 750 V 772" class="arrow"/>
+  <rect x="580" y="600" width="160" height="60" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+  <text x="660" y="638" text-anchor="middle" class="box">LayerNorm</text>
 
-  <rect x="740" y="775" width="180" height="50" rx="8" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
-  <text x="830" y="805" text-anchor="middle" class="box-title">anchor = h_out[:, -1]</text>
+  <path d="M 740 630 H 778" class="arrow"/>
 
-  <path d="M 920 800 H 1097" class="arrow"/>
+  <rect x="780" y="590" width="200" height="80" rx="10" fill="#ccfbf1" stroke="#0f766e" stroke-width="2"/>
+  <text x="880" y="637" text-anchor="middle" class="box">KS3 Decoder</text>
 
-  <!-- ================= block head ================= -->
-  <rect x="1100" y="760" width="270" height="170" rx="12" fill="#fff1f2" stroke="#be123c" stroke-width="2"/>
-  <text x="1235" y="788" text-anchor="middle" class="panel" fill="#be123c">block head</text>
-  <text x="1235" y="815" text-anchor="middle" class="box-title">BlockConv(anchor + Δ_k)</text>
-  <text x="1235" y="838" text-anchor="middle" class="box-sub">offsets → one trunk pass → n positions</text>
-  <text x="1235" y="861" text-anchor="middle" class="box-title">logits_k = hs_k @ unembedᵀ</text>
-  <text x="1235" y="884" text-anchor="middle" class="box-sub">greedy walk over the block offsets</text>
-  <text x="1235" y="912" text-anchor="middle" class="box-title" fill="#be123c">→ draft tokens [B, n]</text>
+  <path d="M 980 630 H 1000" class="arrow"/>
+  <circle cx="1015" cy="630" r="15" fill="#ffffff" stroke="#334155" stroke-width="2"/>
+  <text x="1015" y="636" text-anchor="middle" class="box">+</text>
 
-  <!-- unembed rows into the block head -->
-  <path d="M 220 834 V 940 H 1235 V 932" class="target-arrow"/>
-  <text x="700" y="934" text-anchor="middle" class="small" fill="#7c3aed">unembed rows</text>
+  <path d="M 570 590 V 680 H 1015 V 647" class="arrow"/>
 
-  <!-- KV tap into attention -->
-  <path d="M 370 375 H 700 V 420 H 708" class="target-arrow"/>
-  <text x="460" y="366" text-anchor="middle" class="small" fill="#7c3aed">K/V tap · int8 g128</text>
+  <path d="M 1030 630 H 1032 V 745 H 1002" class="arrow"/>
 
-  <!-- legend -->
-  <text x="700" y="978" text-anchor="middle" class="small">solid arrow = activation flow · dashed purple = target-frozen data (tables / KV taps) · ⊕ = residual add</text>
+  <rect x="580" y="710" width="420" height="70" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+  <text x="790" y="753" text-anchor="middle" class="box">Adjacent Injection</text>
+
+  <path d="M 790 780 V 818" class="arrow"/>
+
+  <rect x="700" y="820" width="220" height="70" rx="10" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+  <text x="810" y="863" text-anchor="middle" class="box">LayerNorm</text>
+
+  <path d="M 810 890 V 908" class="arrow"/>
+
+  <rect x="700" y="910" width="220" height="60" rx="10" fill="#ffffff" stroke="#334155" stroke-width="2"/>
+  <text x="810" y="948" text-anchor="middle" class="box">Anchor</text>
+
+  <path d="M 920 940 H 1080 V 860 H 1118" class="arrow"/>
+
+  <!-- block head -->
+  <rect x="1120" y="760" width="230" height="200" rx="14" fill="#fff1f2" stroke="#be123c" stroke-width="2"/>
+  <text x="1235" y="795" text-anchor="middle" class="panel" fill="#be123c">Block head</text>
+  <text x="1235" y="835" text-anchor="middle" class="box">BlockConv + Δ</text>
+  <text x="1235" y="875" text-anchor="middle" class="box">Unembed logits</text>
+  <text x="1235" y="915" text-anchor="middle" class="box">Greedy walk</text>
+  <text x="1235" y="945" text-anchor="middle" class="box" fill="#be123c">Draft tokens</text>
+
+  <path d="M 400 745 H 430 V 120 H 1235 V 758" class="target-arrow"/>
+
+  <path d="M 400 445 H 760 V 520 H 778" class="target-arrow"/>
 </svg>
